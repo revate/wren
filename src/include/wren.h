@@ -324,6 +324,12 @@ WREN_API void wrenCollectGarbage(WrenVM* vm);
 WREN_API WrenInterpretResult wrenInterpret(WrenVM* vm, const char* module,
                                   const char* source);
 
+// Like [wrenInterpret], but can be called from within a foreign method
+// (re-entrant).  Saves the current apiStack and fiber, runs the source in a
+// new fiber, then restores the caller's context so slots remain valid.
+WREN_API WrenInterpretResult wrenInterpretReentrant(WrenVM* vm,
+    const char* module, const char* source);
+
 // Creates a handle that can be used to invoke a method with [signature] on
 // using a receiver and arguments that are set up on the stack.
 //
@@ -345,6 +351,17 @@ WREN_API WrenHandle* wrenMakeCallHandle(WrenVM* vm, const char* signature);
 //
 // After this returns, you can access the return value from slot 0 on the stack.
 WREN_API WrenInterpretResult wrenCall(WrenVM* vm, WrenHandle* method);
+
+// Like [wrenCall], but can be called from within a foreign method (re-entrant).
+// Creates a temporary fiber, copies the receiver (slot 0) and [numArgs]
+// arguments (slots 1..numArgs) to it, executes the call, and places the
+// result back in slot 0 of the caller's API stack.  The original fiber and
+// API-stack context are fully restored afterward.
+WREN_API WrenInterpretResult wrenCallReentrant(WrenVM* vm,
+    WrenHandle* method, int numArgs);
+
+// Copies the value in [srcSlot] to [destSlot] on the current API stack.
+WREN_API void wrenCopySlot(WrenVM* vm, int destSlot, int srcSlot);
 
 // Releases the reference stored in [handle]. After calling this, [handle] can
 // no longer be used.
@@ -544,6 +561,57 @@ WREN_API bool wrenHasModule(WrenVM* vm, const char* module);
 // Sets the current fiber to be aborted, and uses the value in [slot] as the
 // runtime error object.
 WREN_API void wrenAbortFiber(WrenVM* vm, int slot);
+
+// REVATE EXTENSION: Set whether methods compiled after this call default
+// to public visibility.  Useful for class-script modules where all methods
+// should be externally callable.
+WREN_API void wrenSetDefaultPublic(WrenVM* vm, bool defaultPublic);
+
+// REVATE EXTENSION: Field-default manipulation for pre-constructor overrides.
+// The slot in [classSlot] must contain an ObjClass.
+
+// Returns the total number of instance fields for the class (including
+// inherited and mixin fields).
+WREN_API int wrenGetClassFieldCount(WrenVM* vm, int classSlot);
+
+// Reads the field default at [fieldIndex] from the class in [classSlot] and
+// stores it in [resultSlot].  Stores null if no defaults array exists.
+WREN_API void wrenGetFieldDefault(WrenVM* vm, int classSlot,
+                                  int fieldIndex, int resultSlot);
+
+// Sets the field default at [fieldIndex] on the class in [classSlot] to the
+// value in [valueSlot].  Allocates the defaults array if needed.
+WREN_API void wrenSetFieldDefault(WrenVM* vm, int classSlot,
+                                  int fieldIndex, int valueSlot);
+
+// REVATE EXTENSION: Direct instance field access for post-constructor patching.
+// The slot in [instanceSlot] must contain an ObjInstance.
+
+// Reads the instance field at [fieldIndex] and stores it in [resultSlot].
+WREN_API void wrenGetInstanceField(WrenVM* vm, int instanceSlot,
+                                   int fieldIndex, int resultSlot);
+
+// Sets the instance field at [fieldIndex] to the value in [valueSlot].
+WREN_API void wrenSetInstanceField(WrenVM* vm, int instanceSlot,
+                                   int fieldIndex, int valueSlot);
+
+// REVATE EXTENSION: Returns the number of fields belonging to the
+// superclass of the class in [classSlot].  Returns 0 if no superclass or
+// if the superclass has no fields.
+WREN_API int wrenGetClassSuperFieldCount(WrenVM* vm, int classSlot);
+
+// REVATE EXTENSION: Class attribute introspection.
+// Reads the class-level attribute map from the class in [classSlot] and stores
+// it in [resultSlot].  This is the inner Map (ClassAttributes.self) that
+// contains groups like "__properties".  Stores null if the class has no
+// runtime-accessible attributes.
+WREN_API void wrenGetClassAttributeMap(WrenVM* vm, int classSlot,
+                                       int resultSlot);
+
+// REVATE EXTENSION: Map key iteration.
+// Creates a new List containing all keys of the Map in [mapSlot] and stores
+// it in [listSlot].  If [mapSlot] does not hold a map, stores null.
+WREN_API void wrenGetMapKeys(WrenVM* vm, int mapSlot, int listSlot);
 
 // Returns the user data associated with the WrenVM.
 WREN_API void* wrenGetUserData(WrenVM* vm);

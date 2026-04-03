@@ -109,6 +109,13 @@ typedef enum
   TOKEN_VAR,
   TOKEN_WHILE,
 
+  // REVATE EXTENSION: new reserved tokens
+  TOKEN_PUBLIC,
+  TOKEN_MIXIN,
+  TOKEN_WITH,
+  TOKEN_ENUM,
+  TOKEN_AT,
+
   TOKEN_FIELD,
   TOKEN_STATIC_FIELD,
   TOKEN_NAME,
@@ -315,6 +322,13 @@ typedef struct
 
   // The signature of the method being compiled.
   Signature* signature;
+
+  // REVATE EXTENSION: field default values.
+  // Parallel arrays: fieldDefaultSlot[i] is the field index,
+  // fieldDefaultValue[i] is the literal default Value.
+  int fieldDefaultSlot[MAX_FIELDS];
+  Value fieldDefaultValue[MAX_FIELDS];
+  int numFieldDefaults;
 } ClassInfo;
 
 struct sCompiler
@@ -408,6 +422,14 @@ static void emitClassAttributes(Compiler* compiler, ClassInfo* classInfo);
 static void copyAttributes(Compiler* compiler, ObjMap* into);
 static void copyMethodAttributes(Compiler* compiler, bool isForeign, 
             bool isStatic, const char* fullSignature, int32_t length);
+// REVATE EXTENSION: forward declaration for field declarations in class body.
+static bool classField(Compiler* compiler, Variable classVariable, bool isPublic);
+// REVATE EXTENSION: forward declaration for typed property declarations.
+static bool typedProperty(Compiler* compiler, Variable classVariable, bool isPublic);
+// REVATE EXTENSION: forward declaration for enum definitions.
+static void enumDefinition(Compiler* compiler);
+// REVATE EXTENSION: forward declaration for mixin definitions.
+static void mixinDefinition(Compiler* compiler);
 
 // The stack effect of each opcode. The index in the array is the opcode, and
 // the value is the stack effect of that instruction.
@@ -620,6 +642,11 @@ static Keyword keywords[] =
   {"true",      4, TOKEN_TRUE},
   {"var",       3, TOKEN_VAR},
   {"while",     5, TOKEN_WHILE},
+  // REVATE EXTENSION: new keywords
+  {"public",    6, TOKEN_PUBLIC},
+  {"mixin",     5, TOKEN_MIXIN},
+  {"with",      4, TOKEN_WITH},
+  {"enum",      4, TOKEN_ENUM},
   {NULL,        0, TOKEN_EOF} // Sentinel to mark the end of the array.
 };
 
@@ -1111,6 +1138,7 @@ static void nextToken(Parser* parser)
       case '-': makeToken(parser, TOKEN_MINUS); return;
       case '~': makeToken(parser, TOKEN_TILDE); return;
       case '?': makeToken(parser, TOKEN_QUESTION); return;
+      case '@': makeToken(parser, TOKEN_AT); return; // REVATE EXTENSION
         
       case '|': twoCharToken(parser, '|', TOKEN_PIPEPIPE, TOKEN_PIPE); return;
       case '&': twoCharToken(parser, '&', TOKEN_AMPAMP, TOKEN_AMP); return;
@@ -2809,6 +2837,12 @@ GrammarRule rules[] =
   /* TOKEN_TRUE          */ PREFIX(boolean),
   /* TOKEN_VAR           */ UNUSED,
   /* TOKEN_WHILE         */ UNUSED,
+  // REVATE EXTENSION: new token rules
+  /* TOKEN_PUBLIC        */ UNUSED,
+  /* TOKEN_MIXIN         */ UNUSED,
+  /* TOKEN_WITH          */ UNUSED,
+  /* TOKEN_ENUM          */ UNUSED,
+  /* TOKEN_AT            */ UNUSED,
   /* TOKEN_FIELD         */ PREFIX(field),
   /* TOKEN_STATIC_FIELD  */ PREFIX(staticField),
   /* TOKEN_NAME          */ { name, NULL, namedSignature, PREC_NONE, NULL },
@@ -2892,6 +2926,7 @@ static int getByteCountForArguments(const uint8_t* bytecode,
     case CODE_FOREIGN_CLASS:
     case CODE_END_MODULE:
     case CODE_END_CLASS:
+    case CODE_BIND_MIXIN:
       return 0;
 
     case CODE_LOAD_LOCAL:
@@ -2903,6 +2938,8 @@ static int getByteCountForArguments(const uint8_t* bytecode,
     case CODE_LOAD_FIELD:
     case CODE_STORE_FIELD:
     case CODE_CLASS:
+    case CODE_MIXIN:
+    case CODE_FIELD_DEFAULT:
       return 1;
 
     case CODE_CONSTANT:
@@ -2932,6 +2969,8 @@ static int getByteCountForArguments(const uint8_t* bytecode,
     case CODE_OR:
     case CODE_METHOD_INSTANCE:
     case CODE_METHOD_STATIC:
+    case CODE_METHOD_INSTANCE_PUBLIC:
+    case CODE_METHOD_STATIC_PUBLIC:
     case CODE_IMPORT_MODULE:
     case CODE_IMPORT_VARIABLE:
       return 2;
@@ -3305,7 +3344,7 @@ static void createConstructor(Compiler* compiler, Signature* signature,
 // Loads the enclosing class onto the stack and then binds the function already
 // on the stack as a method on that class.
 static void defineMethod(Compiler* compiler, Variable classVariable,
-                         bool isStatic, int methodSymbol)
+                         bool isStatic, bool isPublic, int methodSymbol)
 {
   // Load the class. We have to do this for each method because we can't
   // keep the class on top of the stack. If there are static fields, they
@@ -3314,8 +3353,13 @@ static void defineMethod(Compiler* compiler, Variable classVariable,
   // defining a method.
   loadVariable(compiler, classVariable);
 
-  // Define the method.
-  Code instruction = isStatic ? CODE_METHOD_STATIC : CODE_METHOD_INSTANCE;
+  // Define the method. Use public opcodes if the method was marked public.
+  // REVATE EXTENSION: public visibility opcodes
+  Code instruction;
+  if (isPublic)
+    instruction = isStatic ? CODE_METHOD_STATIC_PUBLIC : CODE_METHOD_INSTANCE_PUBLIC;
+  else
+    instruction = isStatic ? CODE_METHOD_STATIC : CODE_METHOD_INSTANCE;
   emitShortArg(compiler, instruction, methodSymbol);
 }
 
@@ -3362,10 +3406,14 @@ static Value consumeLiteral(Compiler* compiler, const char* message)
 
 static bool matchAttribute(Compiler* compiler) {
 
-  if(match(compiler, TOKEN_HASH)) 
+  // REVATE EXTENSION: @ is syntactic sugar for #! (runtime-accessible attribute).
+  bool isAt = match(compiler, TOKEN_AT);
+  bool isHash = !isAt && match(compiler, TOKEN_HASH);
+
+  if(isAt || isHash) 
   {
     compiler->numAttributes++;
-    bool runtimeAccess = match(compiler, TOKEN_BANG);
+    bool runtimeAccess = isAt || match(compiler, TOKEN_BANG);
     if(match(compiler, TOKEN_NAME)) 
     {
       Value group = compiler->parser->previous.value;
@@ -3416,7 +3464,8 @@ static bool matchAttribute(Compiler* compiler) {
     }
     else 
     {
-      error(compiler, "Expect an attribute definition after #.");
+      error(compiler, isAt ? "Expect an attribute name after @."
+                           : "Expect an attribute definition after #.");
     }
 
     consumeLine(compiler, "Expect newline after attribute.");
@@ -3438,6 +3487,41 @@ static bool method(Compiler* compiler, Variable classVariable)
   }
 
   // TODO: What about foreign constructors?
+  // REVATE EXTENSION: parse optional 'public' keyword
+  bool isPublic = match(compiler, TOKEN_PUBLIC);
+
+  // REVATE EXTENSION: enum inside a class body — compiles to a separate
+  // top-level class so it's importable independently.
+  if (match(compiler, TOKEN_ENUM))
+  {
+    // Temporarily detach from the enclosing class to compile the enum
+    // as a top-level definition.
+    ClassInfo* savedClass = compiler->enclosingClass;
+    compiler->enclosingClass = NULL;
+    enumDefinition(compiler);
+    compiler->enclosingClass = savedClass;
+    return true;
+  }
+
+  // REVATE EXTENSION: field declaration — [public] var name [= expr]
+  if (match(compiler, TOKEN_VAR))
+  {
+    return classField(compiler, classVariable, isPublic);
+  }
+
+  // REVATE EXTENSION: typed property — [public] TypeName propName [= expr]
+  // Detected when current token is TOKEN_NAME starting with an uppercase
+  // letter and the next token is also TOKEN_NAME.  The 'public' keyword is
+  // optional and only controls Wren-level getter/setter visibility.
+  // @editor(...) metadata exclusively controls editor exposure.
+  if (peek(compiler) == TOKEN_NAME &&
+      compiler->parser->current.start[0] >= 'A' &&
+      compiler->parser->current.start[0] <= 'Z' &&
+      peekNext(compiler) == TOKEN_NAME)
+  {
+    return typedProperty(compiler, classVariable, isPublic);
+  }
+
   bool isForeign = match(compiler, TOKEN_FOREIGN);
   bool isStatic = match(compiler, TOKEN_STATIC);
   compiler->enclosingClass->inStatic = isStatic;
@@ -3494,13 +3578,25 @@ static bool method(Compiler* compiler, Variable classVariable)
   else
   {
     consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' to begin method body.");
+
+    // REVATE EXTENSION: field defaults are stored on the class via
+    // CODE_FIELD_DEFAULT and applied by wrenNewInstance().  We intentionally
+    // do NOT inject STORE_FIELD_THIS instructions here, because the host
+    // may patch classObj->fieldDefaults[] between CODE_CONSTRUCT (which
+    // calls wrenNewInstance) and the initializer body, allowing per-instance
+    // overrides to be visible inside the constructor.
+
     finishBody(&methodCompiler);
     endCompiler(&methodCompiler, fullSignature, length);
   }
   
   // Define the method. For a constructor, this defines the instance
   // initializer method.
-  defineMethod(compiler, classVariable, isStatic, methodSymbol);
+  // REVATE EXTENSION: constructors, foreign methods, and methods compiled
+  // under defaultPublic mode are always public.
+  bool effectivelyPublic = isPublic || (signature.type == SIG_INITIALIZER)
+      || isForeign || compiler->parser->vm->defaultPublic;
+  defineMethod(compiler, classVariable, isStatic, effectivelyPublic, methodSymbol);
 
   if (signature.type == SIG_INITIALIZER)
   {
@@ -3509,11 +3605,562 @@ static bool method(Compiler* compiler, Variable classVariable)
     int constructorSymbol = signatureSymbol(compiler, &signature);
     
     createConstructor(compiler, &signature, methodSymbol);
-    defineMethod(compiler, classVariable, true, constructorSymbol);
+    defineMethod(compiler, classVariable, true, true, constructorSymbol); // constructors always public
   }
 
   return true;
 }
+
+// REVATE EXTENSION: Compile a field declaration inside a class body.
+//
+// Handles:  [public] var name [= literalExpr]
+//
+// - Allocates a field slot
+// - Generates a getter method (returns the field)
+// - Generates a setter=(_) method (stores the argument)
+// - If "= expr" is present, records the default so constructors can inject it
+// - If isPublic, the getter/setter are marked public; otherwise private.
+//
+// Returns true on success.
+static bool classField(Compiler* compiler, Variable classVariable, bool isPublic)
+{
+  ClassInfo* enclosingClass = compiler->enclosingClass;
+
+  if (enclosingClass == NULL)
+  {
+    error(compiler, "Cannot declare a field outside of a class definition.");
+    return false;
+  }
+
+  if (enclosingClass->isForeign)
+  {
+    error(compiler, "Cannot define fields in a foreign class.");
+    return false;
+  }
+
+  // Consume the field name.
+  consume(compiler, TOKEN_NAME, "Expect field name after 'var'.");
+
+  // Save the field name.
+  const char* fieldName = compiler->parser->previous.start;
+  int fieldLength = compiler->parser->previous.length;
+
+  // Allocate a field slot.
+  int fieldSlot = wrenSymbolTableEnsure(compiler->parser->vm,
+      &enclosingClass->fields, fieldName, fieldLength);
+
+  if (fieldSlot >= MAX_FIELDS)
+  {
+    error(compiler, "A class can only have %d fields.", MAX_FIELDS);
+    return false;
+  }
+
+  // Check for default value: var name = expr
+  if (match(compiler, TOKEN_EQ))
+  {
+    if (enclosingClass->numFieldDefaults >= MAX_FIELDS)
+    {
+      error(compiler, "Too many field defaults.");
+    }
+    else
+    {
+      // Parse a literal default value (Num, String, Bool, null).
+      Value defaultVal = NULL_VAL;
+      if (match(compiler, TOKEN_FALSE))       defaultVal = FALSE_VAL;
+      else if (match(compiler, TOKEN_TRUE))   defaultVal = TRUE_VAL;
+      else if (match(compiler, TOKEN_NULL))   { /* already NULL_VAL */ }
+      else if (match(compiler, TOKEN_NUMBER)) defaultVal = compiler->parser->previous.value;
+      else if (match(compiler, TOKEN_STRING)) defaultVal = compiler->parser->previous.value;
+      else
+      {
+        error(compiler, "Default field value must be a literal (Num, String, Bool, or null).");
+        // Consume the expression to avoid cascading errors.
+        nextToken(compiler->parser);
+      }
+
+      int idx = enclosingClass->numFieldDefaults;
+      enclosingClass->fieldDefaultSlot[idx] = fieldSlot;
+      enclosingClass->fieldDefaultValue[idx] = defaultVal;
+      enclosingClass->numFieldDefaults++;
+    }
+  }
+
+  // ── Generate getter method ──
+  // The getter is: name { return this.field }
+  // Bytecode: LOAD_FIELD_THIS slot, RETURN
+  {
+    Signature getterSig;
+    getterSig.name = fieldName;
+    getterSig.length = fieldLength;
+    getterSig.type = SIG_GETTER;
+    getterSig.arity = 0;
+
+    char fullSig[MAX_METHOD_SIGNATURE];
+    int sigLen;
+    signatureToString(&getterSig, fullSig, &sigLen);
+
+    int getterSymbol = declareMethod(compiler, &getterSig, fullSig, sigLen);
+
+    Compiler getterCompiler;
+    initCompiler(&getterCompiler, compiler->parser, compiler, true);
+
+    emitByteArg(&getterCompiler, CODE_LOAD_FIELD_THIS, fieldSlot);
+    emitOp(&getterCompiler, CODE_RETURN);
+
+    endCompiler(&getterCompiler, fullSig, sigLen);
+
+    defineMethod(compiler, classVariable, false, isPublic, getterSymbol);
+  }
+
+  // ── Generate setter method ──
+  // The setter is: name=(value) { this.field = value; return value }
+  // Bytecode: LOAD_LOCAL_1, STORE_FIELD_THIS slot, LOAD_LOCAL_1, RETURN
+  {
+    Signature setterSig;
+    setterSig.name = fieldName;
+    setterSig.length = fieldLength;
+    setterSig.type = SIG_SETTER;
+    setterSig.arity = 1;
+
+    char fullSig[MAX_METHOD_SIGNATURE];
+    int sigLen;
+    signatureToString(&setterSig, fullSig, &sigLen);
+
+    int setterSymbol = declareMethod(compiler, &setterSig, fullSig, sigLen);
+
+    Compiler setterCompiler;
+    initCompiler(&setterCompiler, compiler->parser, compiler, true);
+
+    // The setter parameter is local slot 1 (slot 0 = this).
+    // We need to declare the parameter as a local so the compiler tracks
+    // the slot count correctly.
+    setterCompiler.numLocals++;
+    setterCompiler.numSlots++;
+
+    // Store the argument into the field.
+    emitOp(&setterCompiler, CODE_LOAD_LOCAL_1);
+    emitByteArg(&setterCompiler, CODE_STORE_FIELD_THIS, fieldSlot);
+    // STORE_FIELD_THIS doesn't pop, so value is still on stack. Return it.
+    emitOp(&setterCompiler, CODE_RETURN);
+
+    endCompiler(&setterCompiler, fullSig, sigLen);
+
+    defineMethod(compiler, classVariable, false, isPublic, setterSymbol);
+  }
+
+  return true;
+}
+
+// REVATE EXTENSION: Compiles a typed property declaration.
+//
+// Syntax:  [@editor(...)] [public] TypeName propName [= defaultExpr]
+//
+// The type name is consumed here and stored as metadata in the class's
+// attributes under a "__properties" group.  The actual field, getter, and
+// setter generation is delegated to classField().
+//
+// @editor(...) is the exclusive gate for editor visibility.  The 'public'
+// keyword only controls Wren-level getter/setter visibility and is
+// independent of editor exposure.
+static bool typedProperty(Compiler* compiler, Variable classVariable,
+                          bool isPublic)
+{
+  ClassInfo* enclosingClass = compiler->enclosingClass;
+  if (enclosingClass == NULL)
+  {
+    error(compiler, "Cannot declare a typed property outside of a class.");
+    return false;
+  }
+
+  // Check whether an @editor(...) attribute was pending before this property.
+  // Only properties annotated with @editor(...) are exposed to the editor.
+  // Other public typed fields remain Wren-side public but are not in the
+  // __properties metadata map.
+  WrenVM* vm = compiler->parser->vm;
+  bool hasEditorTag = false;
+
+  if (compiler->numAttributes > 0 && compiler->attributes->count > 0)
+  {
+    Value editorKey = wrenNewStringLength(vm, "editor", 6);
+    wrenPushRoot(vm, AS_OBJ(editorKey));
+    Value editorVal = wrenMapGet(compiler->attributes, editorKey);
+    if (!IS_UNDEFINED(editorVal) && IS_MAP(editorVal))
+    {
+      hasEditorTag = true;
+    }
+    wrenPopRoot(vm); // editorKey
+  }
+
+  // Read the type name (e.g. "Num", "String", "Bool", "Vector3", "Color3").
+  // The current token is TOKEN_NAME starting with uppercase.
+  consume(compiler, TOKEN_NAME, "Expect type name.");
+  const char* typeName = compiler->parser->previous.start;
+  int typeLen = compiler->parser->previous.length;
+
+  // Store property type metadata in the class attributes, but ONLY if
+  // @editor(...) was present.  This makes @editor the explicit opt-in
+  // for editor-visible properties.
+  // Format: classAttributes["__properties"][propName] = ["TypeName"]
+  if (hasEditorTag && peek(compiler) == TOKEN_NAME)
+  {
+    // Ensure classAttributes map exists.
+    if (enclosingClass->classAttributes == NULL)
+    {
+      enclosingClass->classAttributes = wrenNewMap(vm);
+    }
+    ObjMap* classAttrs = enclosingClass->classAttributes;
+
+    // Create the group key: "__properties"
+    Value groupKey = wrenNewStringLength(vm, "__properties", 12);
+    wrenPushRoot(vm, AS_OBJ(groupKey));
+
+    // Get or create the __properties sub-map.
+    Value propsMapValue = wrenMapGet(classAttrs, groupKey);
+    if (IS_UNDEFINED(propsMapValue))
+    {
+      propsMapValue = OBJ_VAL(wrenNewMap(vm));
+      wrenMapSet(vm, classAttrs, groupKey, propsMapValue);
+    }
+    ObjMap* propsMap = AS_MAP(propsMapValue);
+
+    // Create the property name as a Value (from the *next* token — current).
+    Value propKey = wrenNewStringLength(vm,
+        compiler->parser->current.start,
+        compiler->parser->current.length);
+    wrenPushRoot(vm, AS_OBJ(propKey));
+
+    // Create the type name as a Value.
+    Value typeValue = wrenNewStringLength(vm, typeName, typeLen);
+    wrenPushRoot(vm, AS_OBJ(typeValue));
+
+    // Store as a list: propsMap[propName] = [TypeName]
+    // (matches the existing attribute format: group -> key -> [values])
+    Value keyItemsValue = wrenMapGet(propsMap, propKey);
+    if (IS_UNDEFINED(keyItemsValue))
+    {
+      keyItemsValue = OBJ_VAL(wrenNewList(vm, 0));
+      wrenMapSet(vm, propsMap, propKey, keyItemsValue);
+    }
+    ObjList* keyItems = AS_LIST(keyItemsValue);
+    wrenValueBufferWrite(vm, &keyItems->elements, typeValue);
+
+    wrenPopRoot(vm); // typeValue
+    wrenPopRoot(vm); // propKey
+    wrenPopRoot(vm); // groupKey
+  }
+
+  // Save the property name (which is the current token) before classField()
+  // consumes it.  We need it to look up the field slot afterwards.
+  const char* propNameStart = compiler->parser->current.start;
+  int propNameLen = compiler->parser->current.length;
+
+  // Delegate to classField() which will consume the property name, handle
+  // the optional default value, and generate getter/setter methods.
+  bool ok = classField(compiler, classVariable, isPublic);
+
+  // After classField(), the field slot is now known.  Append it to the
+  // attribute list so the D-side extractor can read the correct index.
+  // Then append any @editor(...) key-value pairs (tip, type, control, etc.)
+  // as alternating string entries.
+  //
+  // Final format:
+  //   __properties[propName] = ["TypeName", fieldSlot, "key1", "val1", ...]
+  if (ok && hasEditorTag && enclosingClass->classAttributes != NULL)
+  {
+    ObjMap* classAttrs = enclosingClass->classAttributes;
+
+    Value groupKey = wrenNewStringLength(vm, "__properties", 12);
+    wrenPushRoot(vm, AS_OBJ(groupKey));
+
+    Value propsMapValue = wrenMapGet(classAttrs, groupKey);
+    if (!IS_UNDEFINED(propsMapValue))
+    {
+      ObjMap* propsMap = AS_MAP(propsMapValue);
+      Value propKey = wrenNewStringLength(vm, propNameStart, propNameLen);
+      wrenPushRoot(vm, AS_OBJ(propKey));
+
+      Value listVal = wrenMapGet(propsMap, propKey);
+      if (!IS_UNDEFINED(listVal) && IS_LIST(listVal))
+      {
+        ObjList* list = AS_LIST(listVal);
+        // Look up the field slot in the symbol table.
+        int fieldSlot = wrenSymbolTableFind(
+            &enclosingClass->fields, propNameStart, propNameLen);
+        if (fieldSlot >= 0)
+        {
+          wrenValueBufferWrite(vm, &list->elements, NUM_VAL((double)fieldSlot));
+        }
+
+        // Append @editor key-value pairs from compiler->attributes.
+        // The attribute map has: { "editor": { "tip": ["..."], "type": ["..."], ... } }
+        // We iterate the inner map and append each key + first value as strings.
+        Value editorKey = wrenNewStringLength(vm, "editor", 6);
+        wrenPushRoot(vm, AS_OBJ(editorKey));
+
+        Value editorVal = wrenMapGet(compiler->attributes, editorKey);
+        if (!IS_UNDEFINED(editorVal) && IS_MAP(editorVal))
+        {
+          ObjMap* editorMap = AS_MAP(editorVal);
+          for (uint32_t j = 0; j < editorMap->capacity; j++)
+          {
+            if (IS_UNDEFINED(editorMap->entries[j].key)) continue;
+
+            // Append the attribute key (e.g. "tip", "type", "control").
+            wrenValueBufferWrite(vm, &list->elements,
+                                 editorMap->entries[j].key);
+
+            // The attribute value is a list; take its first element.
+            Value attrListVal = editorMap->entries[j].value;
+            if (IS_LIST(attrListVal) &&
+                AS_LIST(attrListVal)->elements.count > 0)
+            {
+              wrenValueBufferWrite(vm, &list->elements,
+                                   AS_LIST(attrListVal)->elements.data[0]);
+            }
+            else
+            {
+              // Fallback: store the value directly.
+              wrenValueBufferWrite(vm, &list->elements, attrListVal);
+            }
+          }
+        }
+
+        wrenPopRoot(vm); // editorKey
+      }
+
+      wrenPopRoot(vm); // propKey
+    }
+    wrenPopRoot(vm); // groupKey
+  }
+
+  // Consume the pending @editor(...) attributes so they don't leak to the
+  // next declaration.  (Normally copyMethodAttributes clears them, but
+  // typedProperty is not a method.)
+  if (compiler->numAttributes > 0)
+  {
+    wrenMapClear(vm, compiler->attributes);
+    compiler->numAttributes = 0;
+  }
+
+  return ok;
+}
+
+// REVATE EXTENSION: Compiles an enum definition.
+// Enums compile to a class with public static getters returning integer values.
+//
+// Supports both top-level and class-scoped enums:
+//   enum Rarity { Common, Uncommon, Rare, Legendary }
+//
+// Compiles to the equivalent of:
+//   class Rarity {
+//     public static Common    { 0 }
+//     public static Uncommon  { 1 }
+//     public static Rare      { 2 }
+//     public static Legendary { 3 }
+//   }
+static void enumDefinition(Compiler* compiler)
+{
+  // Enums are always module-level, even when declared inside a class body.
+  // Force module scope for the entire enum compilation so that
+  // declareNamedVariable, defineVariable etc. all see SCOPE_MODULE.
+  // We restore the original scope depth at the very end.
+  int savedScope = compiler->scopeDepth;
+  compiler->scopeDepth = -1;
+
+  // Create a variable to store the enum class.
+  // declareNamedVariable consumes TOKEN_NAME and declares the variable.
+  Variable classVariable;
+  classVariable.scope = SCOPE_MODULE;
+  classVariable.index = declareNamedVariable(compiler);
+
+  // Emit the class name as a string constant.
+  Token* nameToken = &compiler->parser->previous;
+  Value classNameString = wrenNewStringLength(compiler->parser->vm,
+      nameToken->start, nameToken->length);
+  ObjString* className = AS_STRING(classNameString);
+  emitConstant(compiler, classNameString);
+
+  // Implicitly inherit from Object.
+  loadCoreVariable(compiler, "Object");
+
+  // Emit CODE_CLASS with 0 fields (enums have no instance fields).
+  emitByteArg(compiler, CODE_CLASS, 0);
+
+  // Store the class in its variable.
+  defineVariable(compiler, classVariable.index);
+
+  // Push a scope for the class body (matches classDefinition pattern).
+  pushScope(compiler);
+
+  // Set up a temporary ClassInfo so defineMethod/declareMethod work.
+  ClassInfo classInfo;
+  classInfo.isForeign = false;
+  classInfo.name = className;
+  classInfo.classAttributes = NULL;
+  classInfo.methodAttributes = NULL;
+  wrenSymbolTableInit(&classInfo.fields);
+  wrenIntBufferInit(&classInfo.methods);
+  wrenIntBufferInit(&classInfo.staticMethods);
+  classInfo.numFieldDefaults = 0;
+  compiler->enclosingClass = &classInfo;
+
+  // Parse { Member, Member, ... }
+  consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' after enum name.");
+  ignoreNewlines(compiler);
+
+  int ordinal = 0;
+
+  while (peek(compiler) != TOKEN_RIGHT_BRACE && peek(compiler) != TOKEN_EOF)
+  {
+    ignoreNewlines(compiler);
+
+    // Consume the member name.
+    consume(compiler, TOKEN_NAME, "Expect enum member name.");
+
+    const char* memberName = compiler->parser->previous.start;
+    int memberLength = compiler->parser->previous.length;
+
+    // Register the method symbol as a getter (just the bare name).
+    Signature sig;
+    sig.name = memberName;
+    sig.length = memberLength;
+    sig.type = SIG_GETTER;
+    sig.arity = 0;
+    int memberSymbol = signatureSymbol(compiler, &sig);
+
+    // Track as a static method for duplicate detection.
+    classInfo.inStatic = true;
+    wrenIntBufferWrite(compiler->parser->vm, &classInfo.staticMethods, memberSymbol);
+
+    // Compile a tiny method body that returns the ordinal integer.
+    Compiler methodCompiler;
+    initCompiler(&methodCompiler, compiler->parser, compiler, true);
+
+    // Emit: CONSTANT ordinal, RETURN
+    emitConstant(&methodCompiler, NUM_VAL((double)ordinal));
+    emitOp(&methodCompiler, CODE_RETURN);
+
+    endCompiler(&methodCompiler, memberName, memberLength);
+
+    // Define as a public static method on the enum class.
+    defineMethod(compiler, classVariable, /*isStatic=*/true,
+                 /*isPublic=*/true, memberSymbol);
+
+    ordinal++;
+
+    // Allow trailing comma and newlines between members.
+    ignoreNewlines(compiler);
+    if (!match(compiler, TOKEN_COMMA)) break;
+    ignoreNewlines(compiler);
+  }
+
+  ignoreNewlines(compiler);
+  consume(compiler, TOKEN_RIGHT_BRACE, "Expect '}' after enum members.");
+
+  // Clean up.
+  wrenSymbolTableClear(compiler->parser->vm, &classInfo.fields);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.methods);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.staticMethods);
+  compiler->enclosingClass = NULL;
+  popScope(compiler);
+
+  // Restore the original scope depth (e.g. 0 when inside a class body).
+  compiler->scopeDepth = savedScope;
+}
+
+// REVATE EXTENSION ─────────────────────────────────────────────────────────
+// Compiles a mixin definition.  Very similar to classDefinition() but:
+//   1. No superclass ("is" clause) — mixins inherit from Object implicitly
+//   2. No "with" clause (no mixin-to-mixin composition)
+//   3. Emits CODE_MIXIN instead of CODE_CLASS → sets isMixin = true at runtime
+static void mixinDefinition(Compiler* compiler)
+{
+  // Create a variable to store the mixin in.
+  Variable classVariable;
+  classVariable.scope = compiler->scopeDepth == -1 ? SCOPE_MODULE : SCOPE_LOCAL;
+  classVariable.index = declareNamedVariable(compiler);
+  
+  // Create shared class name value.
+  Value classNameString = wrenNewStringLength(compiler->parser->vm,
+      compiler->parser->previous.start, compiler->parser->previous.length);
+  ObjString* className = AS_STRING(classNameString);
+  
+  // Make a string constant for the name.
+  emitConstant(compiler, classNameString);
+
+  // Implicitly inherit from Object (mixins have no superclass clause).
+  loadCoreVariable(compiler, "Object");
+
+  // Store a placeholder for the number of fields.
+  int numFieldsInstruction = emitByteArg(compiler, CODE_MIXIN, 255);
+
+  // Store it in its name.
+  defineVariable(compiler, classVariable.index);
+
+  // Push a scope for the mixin body.
+  pushScope(compiler);
+
+  ClassInfo classInfo;
+  classInfo.isForeign = false;
+  classInfo.name = className;
+
+  classInfo.classAttributes = compiler->attributes->count > 0
+        ? wrenNewMap(compiler->parser->vm) 
+        : NULL;
+  classInfo.methodAttributes = NULL;
+  copyAttributes(compiler, classInfo.classAttributes);
+
+  wrenSymbolTableInit(&classInfo.fields);
+  wrenIntBufferInit(&classInfo.methods);
+  wrenIntBufferInit(&classInfo.staticMethods);
+  classInfo.numFieldDefaults = 0;
+  compiler->enclosingClass = &classInfo;
+
+  // Compile the method definitions.
+  consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' after mixin declaration.");
+  matchLine(compiler);
+
+  while (!match(compiler, TOKEN_RIGHT_BRACE))
+  {
+    if (!method(compiler, classVariable)) break;
+    if (match(compiler, TOKEN_RIGHT_BRACE)) break;
+    consumeLine(compiler, "Expect newline after definition in mixin.");
+  }
+  
+  // If any attributes, emit them.
+  bool hasAttr = classInfo.classAttributes != NULL || 
+                 classInfo.methodAttributes != NULL;
+  if (hasAttr)
+  {
+    emitClassAttributes(compiler, &classInfo);
+    loadVariable(compiler, classVariable);
+    emitOp(compiler, CODE_END_CLASS);
+  }
+
+  // REVATE EXTENSION: emit class-level field defaults for mixin.
+  if (classInfo.numFieldDefaults > 0)
+  {
+    loadVariable(compiler, classVariable);
+    for (int i = 0; i < classInfo.numFieldDefaults; i++)
+    {
+      emitConstant(compiler, classInfo.fieldDefaultValue[i]);
+      emitByteArg(compiler, CODE_FIELD_DEFAULT, classInfo.fieldDefaultSlot[i]);
+    }
+    emitOp(compiler, CODE_POP);
+  }
+
+  // Patch the field count.
+  compiler->fn->code.data[numFieldsInstruction] =
+      (uint8_t)classInfo.fields.count;
+  
+  // Clean up.
+  wrenSymbolTableClear(compiler->parser->vm, &classInfo.fields);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.methods);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.staticMethods);
+  compiler->enclosingClass = NULL;
+  popScope(compiler);
+}
+// ─────────────────────────────────────────────────────── end REVATE EXTENSION
 
 // Compiles a class definition. Assumes the "class" token has already been
 // consumed (along with a possibly preceding "foreign" token).
@@ -3545,6 +4192,28 @@ static void classDefinition(Compiler* compiler, bool isForeign)
     loadCoreVariable(compiler, "Object");
   }
 
+  // REVATE EXTENSION: parse "with Mixin1, Mixin2, ..." clause.
+  // We remember the mixin names so we can emit CODE_BIND_MIXIN later (after
+  // the class is created and stored).
+  #define MAX_WITH_MIXINS 16
+  Token mixinTokens[MAX_WITH_MIXINS];
+  int numMixins = 0;
+  if (match(compiler, TOKEN_WITH))
+  {
+    do
+    {
+      consume(compiler, TOKEN_NAME, "Expect mixin name after 'with'.");
+      if (numMixins < MAX_WITH_MIXINS)
+      {
+        mixinTokens[numMixins++] = compiler->parser->previous;
+      }
+      else
+      {
+        error(compiler, "A class cannot have more than %d mixins.", MAX_WITH_MIXINS);
+      }
+    } while (match(compiler, TOKEN_COMMA));
+  }
+
   // Store a placeholder for the number of fields argument. We don't know the
   // count until we've compiled all the methods to see which fields are used.
   int numFieldsInstruction = -1;
@@ -3559,6 +4228,26 @@ static void classDefinition(Compiler* compiler, bool isForeign)
 
   // Store it in its name.
   defineVariable(compiler, classVariable.index);
+
+  // REVATE EXTENSION: emit CODE_BIND_MIXIN for each mixin in the 'with' clause.
+  // For each one we push the class and then the mixin, then bind.
+  for (int i = 0; i < numMixins; i++)
+  {
+    loadVariable(compiler, classVariable);
+    // Resolve the mixin name from the token we saved earlier.
+    Variable mixinVar = resolveName(compiler,
+        mixinTokens[i].start, mixinTokens[i].length);
+    if (mixinVar.index == -1)
+    {
+      error(compiler, "Unknown mixin '%.*s'.",
+            mixinTokens[i].length, mixinTokens[i].start);
+    }
+    else
+    {
+      loadVariable(compiler, mixinVar);
+    }
+    emitOp(compiler, CODE_BIND_MIXIN);
+  }
 
   // Push a local variable scope. Static fields in a class body are hoisted out
   // into local variables declared in this scope. Methods that use them will
@@ -3587,6 +4276,8 @@ static void classDefinition(Compiler* compiler, bool isForeign)
   // Set up symbol buffers to track duplicate static and instance methods.
   wrenIntBufferInit(&classInfo.methods);
   wrenIntBufferInit(&classInfo.staticMethods);
+  // REVATE EXTENSION: initialize field defaults counter.
+  classInfo.numFieldDefaults = 0;
   compiler->enclosingClass = &classInfo;
 
   // Compile the method definitions.
@@ -3615,6 +4306,19 @@ static void classDefinition(Compiler* compiler, bool isForeign)
     // so we put it inside this condition. Later, we can always
     // emit it and use it as needed.
     emitOp(compiler, CODE_END_CLASS);
+  }
+
+  // REVATE EXTENSION: emit class-level field defaults so that they are
+  // available for mixin merging and CONSTRUCT-time initialization.
+  if (!isForeign && classInfo.numFieldDefaults > 0)
+  {
+    loadVariable(compiler, classVariable);
+    for (int i = 0; i < classInfo.numFieldDefaults; i++)
+    {
+      emitConstant(compiler, classInfo.fieldDefaultValue[i]);
+      emitByteArg(compiler, CODE_FIELD_DEFAULT, classInfo.fieldDefaultSlot[i]);
+    }
+    emitOp(compiler, CODE_POP);
   }
 
   // Update the class with the number of fields.
@@ -3746,6 +4450,18 @@ void definition(Compiler* compiler)
   {
     consume(compiler, TOKEN_CLASS, "Expect 'class' after 'foreign'.");
     classDefinition(compiler, true);
+    return;
+  }
+  // REVATE EXTENSION: top-level enum definition
+  else if (match(compiler, TOKEN_ENUM))
+  {
+    enumDefinition(compiler);
+    return;
+  }
+  // REVATE EXTENSION: top-level mixin definition
+  else if (match(compiler, TOKEN_MIXIN))
+  {
+    mixinDefinition(compiler);
     return;
   }
 

@@ -377,6 +377,9 @@ typedef struct
 {
   MethodType type;
 
+  // REVATE EXTENSION: visibility flag (false = private, true = public)
+  bool isPublic;
+
   // The method function itself. The [type] determines which field of the union
   // is used.
   union
@@ -413,6 +416,17 @@ struct sObjClass
   
   // The ClassAttribute for the class, if any
   Value attributes;
+
+  // REVATE EXTENSION: Mixin support.
+  bool isMixin;             // true = mixin, cannot be instantiated directly
+  ObjClass** mixins;        // array of bound mixins (for hasMixin checks)
+  int numMixins;            // count of bound mixins
+
+  // REVATE EXTENSION: Class-level field defaults.
+  // If non-NULL, an array of [numFields] Values.  CONSTRUCT uses these
+  // instead of NULL_VAL when creating instances.  Populated via
+  // CODE_FIELD_DEFAULT and merged during wrenBindMixin / wrenBindSuperclass.
+  Value* fieldDefaults;
 };
 
 typedef struct
@@ -632,6 +646,15 @@ ObjClass* wrenNewClass(WrenVM* vm, ObjClass* superclass, int numFields,
                        ObjString* name);
 
 void wrenBindMethod(WrenVM* vm, ObjClass* classObj, int symbol, Method method);
+
+// REVATE EXTENSION: Binds a mixin's methods and fields into [classObj].
+// Field indices in mixin closures are offset by [classObj]->numFields before
+// binding.  Stores the mixin pointer for hasMixin() checks.
+void wrenBindMixin(WrenVM* vm, ObjClass* classObj, ObjClass* mixin);
+
+// REVATE EXTENSION: Clones a closure, deep-copying its ObjFn bytecode and
+// adding [offset] to every LOAD_FIELD_THIS / STORE_FIELD_THIS operand.
+ObjClosure* wrenCloneClosureWithFieldOffset(WrenVM* vm, ObjClosure* src, int offset);
 
 // Creates a new closure object that invokes [fn]. Allocates room for its
 // upvalues, but assumes outside code will populate it.

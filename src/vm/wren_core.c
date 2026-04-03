@@ -897,6 +897,31 @@ DEF_PRIMITIVE(object_type)
   RETURN_OBJ(wrenGetClass(vm, args[0]));
 }
 
+// REVATE EXTENSION: hasMixin(_) — checks if the receiver's class (or any
+// ancestor) was bound with the given mixin.
+DEF_PRIMITIVE(object_hasMixin)
+{
+  if (!IS_CLASS(args[1]))
+  {
+    RETURN_ERROR("Argument must be a class (mixin).");
+  }
+
+  ObjClass* target = AS_CLASS(args[1]);
+  ObjClass* classObj = wrenGetClass(vm, args[0]);
+
+  // Walk the class hierarchy.
+  while (classObj != NULL)
+  {
+    for (int i = 0; i < classObj->numMixins; i++)
+    {
+      if (classObj->mixins[i] == target) RETURN_BOOL(true);
+    }
+    classObj = classObj->superclass;
+  }
+
+  RETURN_BOOL(false);
+}
+
 DEF_PRIMITIVE(range_from)
 {
   RETURN_NUM(AS_RANGE(args[0])->from);
@@ -1250,6 +1275,7 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->objectClass, "is(_)", object_is);
   PRIMITIVE(vm->objectClass, "toString", object_toString);
   PRIMITIVE(vm->objectClass, "type", object_type);
+  PRIMITIVE(vm->objectClass, "hasMixin(_)", object_hasMixin);
 
   // Now we can define Class, which is a subclass of Object.
   vm->classClass = defineClass(vm, coreModule, "Class");

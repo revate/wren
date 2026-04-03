@@ -111,6 +111,10 @@ struct WrenVM
   // There is a single global symbol table for all method names on all classes.
   // Method calls are dispatched directly by index in this table.
   SymbolTable methodNames;
+
+  // REVATE EXTENSION: When true, all methods compiled via wrenInterpret()
+  // default to public visibility (used for class-script modules).
+  bool defaultPublic;
 };
 
 // A generic allocation function that handles all explicit memory management.

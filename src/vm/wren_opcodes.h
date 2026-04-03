@@ -194,6 +194,24 @@ OPCODE(METHOD_INSTANCE, -2)
 // closure.
 OPCODE(METHOD_STATIC, -2)
 
+// REVATE EXTENSION: Public-visibility variants of METHOD_INSTANCE/METHOD_STATIC.
+// Same semantics but set Method.isPublic = true on the bound method.
+OPCODE(METHOD_INSTANCE_PUBLIC, -2)
+OPCODE(METHOD_STATIC_PUBLIC, -2)
+
+// REVATE EXTENSION: Creates a mixin class.  Same as CLASS but sets isMixin = true.
+// Byte [arg] is the number of fields in the mixin.
+OPCODE(MIXIN, -1)
+
+// REVATE EXTENSION: Binds a mixin to a class.  Pops the mixin, then the class.
+OPCODE(BIND_MIXIN, -2)
+
+// REVATE EXTENSION: Stores a field default on a class.
+// Stack: ..., class, value → ..., class
+// Byte [arg] is the field index (class-local, adjusted by superclass offset at
+// runtime).  Pops the value but leaves the class.
+OPCODE(FIELD_DEFAULT, -1)
+
 // This is executed at the end of the module's body. Pushes NULL onto the stack
 // as the "return value" of the import statement and stores the module as the
 // most recently imported one.

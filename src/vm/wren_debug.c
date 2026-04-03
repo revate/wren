@@ -298,6 +298,17 @@ static int dumpInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     case CODE_FOREIGN_CLASS: printf("FOREIGN_CLASS\n"); break;
     case CODE_END_CLASS: printf("END_CLASS\n"); break;
 
+    // REVATE EXTENSION: mixin opcodes
+    case CODE_MIXIN:
+    {
+      int numFields = READ_BYTE();
+      printf("%-16s %5d fields\n", "MIXIN", numFields);
+      break;
+    }
+    case CODE_BIND_MIXIN: printf("BIND_MIXIN\n"); break;
+
+    case CODE_FIELD_DEFAULT: BYTE_INSTRUCTION("FIELD_DEFAULT");
+
     case CODE_METHOD_INSTANCE:
     {
       int symbol = READ_SHORT();
@@ -310,6 +321,23 @@ static int dumpInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     {
       int symbol = READ_SHORT();
       printf("%-16s %5d '%s'\n", "METHOD_STATIC", symbol,
+             vm->methodNames.data[symbol]->value);
+      break;
+    }
+
+    // REVATE EXTENSION: public method opcodes
+    case CODE_METHOD_INSTANCE_PUBLIC:
+    {
+      int symbol = READ_SHORT();
+      printf("%-16s %5d '%s'\n", "METHOD_INST_PUB", symbol,
+             vm->methodNames.data[symbol]->value);
+      break;
+    }
+
+    case CODE_METHOD_STATIC_PUBLIC:
+    {
+      int symbol = READ_SHORT();
+      printf("%-16s %5d '%s'\n", "METHOD_STAT_PUB", symbol,
              vm->methodNames.data[symbol]->value);
       break;
     }

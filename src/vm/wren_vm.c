@@ -1,4 +1,5 @@
 #include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "wren.h"
@@ -346,12 +347,18 @@ static WrenForeignMethodFn findForeignMethod(WrenVM* vm,
 // Aborts the current fiber if the method is a foreign method that could not be
 // found.
 static void bindMethod(WrenVM* vm, int methodType, int symbol,
-                       ObjModule* module, ObjClass* classObj, Value methodValue)
+                       ObjModule* module, ObjClass* classObj, Value methodValue,
+                       bool isPublic)
 {
   const char* className = classObj->name->value;
   if (methodType == CODE_METHOD_STATIC) classObj = classObj->obj.classObj;
 
+  // REVATE EXTENSION: Core module methods are always public.
+  // The core module has a NULL name.
+  if (module->name == NULL) isPublic = true;
+
   Method method;
+  method.isPublic = isPublic; // REVATE EXTENSION: propagate visibility
   if (IS_STRING(methodValue))
   {
     const char* name = AS_CSTRING(methodValue);
@@ -587,6 +594,7 @@ static void bindForeignClass(WrenVM* vm, ObjClass* classObj, ObjModule* module)
   
   Method method;
   method.type = METHOD_FOREIGN;
+  method.isPublic = true; // Built-in allocator is always public
 
   // Add the symbol even if there is no allocator so we can ensure that the
   // symbol itself is always in the symbol table.
@@ -1038,10 +1046,131 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       if (symbol >= classObj->methods.count ||
           (method = &classObj->methods.data[symbol])->type == METHOD_NONE)
       {
+        // ---- REVATE EXTENSION: foreign-class dynamic dispatch ----
+        // When a method is not found on a foreign-class instance, redirect:
+        //   getter  obj.Foo      →  obj["Foo"]      (subscript [_])
+        //   method  obj.foo(a,b) →  obj.call("foo",a,b)
+        // This enables natural property-style child access and transparent
+        // class-script method dispatch on Instance wrappers.
+        if (IS_FOREIGN(args[0]))
+        {
+          ObjString* sigStr = vm->methodNames.data[symbol];
+          const char* sig = sigStr->value;
+          int sigLen = (int)sigStr->length;
+
+          // Find the first '(' to separate name from arg signature.
+          int parenPos = -1;
+          for (int i = 0; i < sigLen; i++)
+          {
+            if (sig[i] == '(') { parenPos = i; break; }
+          }
+
+          if (parenPos < 0)
+          {
+            // ---- Getter: obj.Foo → obj["Foo"] ----
+            int subSym = wrenSymbolTableFind(&vm->methodNames, "[_]", 3);
+            if (subSym >= 0 && subSym < (int)classObj->methods.count &&
+                classObj->methods.data[subSym].type != METHOD_NONE)
+            {
+              // Ensure stack space for the extra argument.
+              wrenEnsureStack(vm, fiber,
+                  (int)(fiber->stackTop - fiber->stack) + 1);
+              // args pointer may have moved after wrenEnsureStack.
+              args = fiber->stackTop - numArgs;
+
+              Value nameVal = wrenNewStringLength(vm, sig, (size_t)sigLen);
+              PUSH(nameVal);
+              numArgs = 2;
+              args = fiber->stackTop - numArgs;
+              symbol = subSym;
+              method = &classObj->methods.data[subSym];
+              goto dispatchMethod;
+            }
+          }
+          else
+          {
+            // ---- Method: obj.foo(...) → obj.call("foo", ...) ----
+            // Original numArgs includes receiver.  We need one more for
+            // the method-name string that gets inserted at args[1].
+            // Build the "call(_, _, ...)" signature with (numArgs)
+            // underscores: one for methodName + (numArgs-1) original args.
+            char callSig[128];
+            int callSigLen = 0;
+            callSig[callSigLen++] = 'c';
+            callSig[callSigLen++] = 'a';
+            callSig[callSigLen++] = 'l';
+            callSig[callSigLen++] = 'l';
+            callSig[callSigLen++] = '(';
+            for (int i = 0; i < numArgs; i++)
+            {
+              if (i > 0) callSig[callSigLen++] = ',';
+              callSig[callSigLen++] = '_';
+            }
+            callSig[callSigLen++] = ')';
+            callSig[callSigLen] = '\0';
+
+            int callSym = wrenSymbolTableFind(&vm->methodNames,
+                                              callSig, callSigLen);
+            if (callSym >= 0 && callSym < (int)classObj->methods.count &&
+                classObj->methods.data[callSym].type != METHOD_NONE)
+            {
+              // Ensure stack space.
+              wrenEnsureStack(vm, fiber,
+                  (int)(fiber->stackTop - fiber->stack) + 1);
+              args = fiber->stackTop - numArgs;
+
+              // Create method-name string (bare name without parens).
+              Value nameVal = wrenNewStringLength(vm, sig, (size_t)parenPos);
+
+              // Shift existing arguments up by 1 to make room for the
+              // method name at args[1].
+              // Stack layout: [receiver, arg1, arg2, ...]
+              //            →  [receiver, "name", arg1, arg2, ...]
+              for (int i = numArgs - 1; i >= 1; i--)
+              {
+                args[i + 1] = args[i];
+              }
+              fiber->stackTop++;
+              args[1] = nameVal;
+
+              numArgs++;
+              args = fiber->stackTop - numArgs;
+              symbol = callSym;
+              method = &classObj->methods.data[callSym];
+              goto dispatchMethod;
+            }
+          }
+        }
+        // ---- END REVATE EXTENSION ----
+
         methodNotFound(vm, classObj, symbol);
         RUNTIME_ERROR();
       }
 
+      // ---- REVATE EXTENSION: visibility enforcement (class-only) ----
+      // Private methods can only be called from within the same class.
+      if (!method->isPublic)
+      {
+        // Get the caller's receiver class (slot 0 of the current frame).
+        ObjClass* callerClass = wrenGetClassInline(vm, stackStart[0]);
+
+        // If the caller class differs from the target class, block the call.
+        // This allows same-class access but blocks external calls to private
+        // methods. Inherited private methods: the check compares against the
+        // resolved target class, so subclass→inherited private is allowed
+        // (method was copied down), while external→private is blocked.
+        if (callerClass != classObj)
+        {
+          ObjString* sigStr = vm->methodNames.data[symbol];
+          vm->fiber->error = wrenStringFormat(vm,
+              "'@' is private to class '@'.",
+              OBJ_VAL(sigStr), OBJ_VAL(classObj->name));
+          RUNTIME_ERROR();
+        }
+      }
+      // ---- END REVATE EXTENSION ----
+
+      dispatchMethod:
       switch (method->type)
       {
         case METHOD_PRIMITIVE:
@@ -1309,6 +1438,15 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       DISPATCH();
     }
 
+    // REVATE EXTENSION: identical to CLASS but marks the result as a mixin.
+    CASE_CODE(MIXIN):
+    {
+      createClass(vm, READ_BYTE(), NULL);
+      if (wrenHasError(fiber)) RUNTIME_ERROR();
+      AS_CLASS(fiber->stackTop[-1])->isMixin = true;
+      DISPATCH();
+    }
+
     CASE_CODE(FOREIGN_CLASS):
     {
       createClass(vm, -1, fn->module);
@@ -1316,13 +1454,55 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       DISPATCH();
     }
 
+    // REVATE EXTENSION: pops class and mixin, binds the mixin into the class.
+    CASE_CODE(BIND_MIXIN):
+    {
+      ObjClass* mixin = AS_CLASS(POP());
+      ObjClass* classObj = AS_CLASS(POP());
+      wrenBindMixin(vm, classObj, mixin);
+      DISPATCH();
+    }
+
+    // REVATE EXTENSION: stores a field default on a class.
+    // Stack: ..., class, value → ..., class
+    CASE_CODE(FIELD_DEFAULT):
+    {
+      int slot = READ_BYTE();
+      Value val = POP();
+      ObjClass* classObj = AS_CLASS(PEEK());
+
+      // Adjust local field index to absolute index.
+      int absSlot = slot;
+      if (classObj->superclass != NULL)
+        absSlot += classObj->superclass->numFields;
+
+      // Lazily allocate the fieldDefaults array.
+      if (classObj->fieldDefaults == NULL)
+      {
+        classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);
+        for (int i = 0; i < classObj->numFields; i++)
+          classObj->fieldDefaults[i] = NULL_VAL;
+      }
+      if (absSlot < classObj->numFields)
+        classObj->fieldDefaults[absSlot] = val;
+      DISPATCH();
+    }
+
     CASE_CODE(METHOD_INSTANCE):
     CASE_CODE(METHOD_STATIC):
+    CASE_CODE(METHOD_INSTANCE_PUBLIC):
+    CASE_CODE(METHOD_STATIC_PUBLIC):
     {
       uint16_t symbol = READ_SHORT();
       ObjClass* classObj = AS_CLASS(PEEK());
       Value method = PEEK2();
-      bindMethod(vm, instruction, symbol, fn->module, classObj, method);
+      // REVATE EXTENSION: determine visibility and base method type from opcode
+      bool isPublic = (instruction == CODE_METHOD_INSTANCE_PUBLIC ||
+                       instruction == CODE_METHOD_STATIC_PUBLIC);
+      int methodType = (instruction == CODE_METHOD_INSTANCE ||
+                        instruction == CODE_METHOD_INSTANCE_PUBLIC)
+                       ? CODE_METHOD_INSTANCE : CODE_METHOD_STATIC;
+      bindMethod(vm, methodType, symbol, fn->module, classObj, method, isPublic);
       if (wrenHasError(fiber)) RUNTIME_ERROR();
       DROP();
       DROP();
@@ -1473,6 +1653,64 @@ WrenInterpretResult wrenCall(WrenVM* vm, WrenHandle* method)
   return result;
 }
 
+WrenInterpretResult wrenCallReentrant(WrenVM* vm,
+    WrenHandle* method, int numArgs)
+{
+  ASSERT(method != NULL, "Method cannot be NULL.");
+  ASSERT(IS_CLOSURE(method->value), "Method must be a method handle.");
+  // Must be inside a foreign call (apiStack is set).
+  ASSERT(vm->apiStack != NULL, "Must be in a foreign call.");
+
+  ObjClosure* closure = AS_CLOSURE(method->value);
+  int arity = closure->fn->arity;
+  int slotsNeeded = numArgs + 1; // receiver + args
+  int maxSlots = closure->fn->maxSlots;
+  if (maxSlots > slotsNeeded) slotsNeeded = maxSlots;
+
+  // ---- save current call context ----
+  Value* savedApiStack = vm->apiStack;
+  ObjFiber* savedFiber  = vm->fiber;
+
+  // ---- set up a fresh fiber (wrenEnsureSlots creates one) ----
+  vm->apiStack = NULL;
+  vm->fiber    = NULL;
+  wrenEnsureSlots(vm, slotsNeeded);
+
+  // Copy receiver + args from the caller's api stack to the new fiber.
+  for (int i = 0; i <= numArgs; i++)
+  {
+    vm->apiStack[i] = savedApiStack[i];
+  }
+
+  // ---- run the call (same steps as wrenCall) ----
+  vm->apiStack = NULL;
+  vm->fiber->stackTop = &vm->fiber->stack[maxSlots > numArgs + 1
+                                            ? maxSlots : numArgs + 1];
+
+  wrenCallFunction(vm, vm->fiber, closure, 0);
+  WrenInterpretResult result = runInterpreter(vm, vm->fiber);
+
+  // ---- read the return value ----
+  Value returnVal = NULL_VAL;
+  if (result == WREN_RESULT_SUCCESS && vm->fiber != NULL)
+  {
+    returnVal = vm->fiber->stack[0];
+  }
+
+  // ---- restore caller context ----
+  vm->fiber    = savedFiber;
+  vm->apiStack = savedApiStack;
+  savedApiStack[0] = returnVal;
+
+  return result;
+}
+
+void wrenCopySlot(WrenVM* vm, int destSlot, int srcSlot)
+{
+  ASSERT(vm->apiStack != NULL, "Must have API stack.");
+  vm->apiStack[destSlot] = vm->apiStack[srcSlot];
+}
+
 WrenHandle* wrenMakeHandle(WrenVM* vm, Value value)
 {
   if (IS_OBJ(value)) wrenPushRoot(vm, AS_OBJ(value));
@@ -1523,6 +1761,22 @@ WrenInterpretResult wrenInterpret(WrenVM* vm, const char* module,
   vm->apiStack = NULL;
 
   return runInterpreter(vm, fiber);
+}
+
+WrenInterpretResult wrenInterpretReentrant(WrenVM* vm, const char* module,
+                                           const char* source)
+{
+  // Save caller context (may be inside a foreign call).
+  Value* savedApiStack = vm->apiStack;
+  ObjFiber* savedFiber = vm->fiber;
+
+  WrenInterpretResult result = wrenInterpret(vm, module, source);
+
+  // Restore caller context so slots remain valid after we return.
+  vm->fiber    = savedFiber;
+  vm->apiStack = savedApiStack;
+
+  return result;
 }
 
 ObjClosure* wrenCompileSource(WrenVM* vm, const char* module, const char* source,
@@ -1991,4 +2245,156 @@ void* wrenGetUserData(WrenVM* vm)
 void wrenSetUserData(WrenVM* vm, void* userData)
 {
 	vm->config.userData = userData;
+}
+
+// REVATE EXTENSION
+void wrenSetDefaultPublic(WrenVM* vm, bool defaultPublic)
+{
+	vm->defaultPublic = defaultPublic;
+}
+
+// REVATE EXTENSION: Field-default manipulation
+int wrenGetClassFieldCount(WrenVM* vm, int classSlot)
+{
+	validateApiSlot(vm, classSlot);
+	ASSERT(IS_CLASS(vm->apiStack[classSlot]), "Slot must hold a class.");
+	ObjClass* classObj = AS_CLASS(vm->apiStack[classSlot]);
+	return classObj->numFields;
+}
+
+int wrenGetClassSuperFieldCount(WrenVM* vm, int classSlot)
+{
+	validateApiSlot(vm, classSlot);
+	ASSERT(IS_CLASS(vm->apiStack[classSlot]), "Slot must hold a class.");
+	ObjClass* classObj = AS_CLASS(vm->apiStack[classSlot]);
+	if (classObj->superclass != NULL)
+		return classObj->superclass->numFields;
+	return 0;
+}
+
+void wrenGetFieldDefault(WrenVM* vm, int classSlot,
+                         int fieldIndex, int resultSlot)
+{
+	validateApiSlot(vm, classSlot);
+	validateApiSlot(vm, resultSlot);
+	ObjClass* classObj = AS_CLASS(vm->apiStack[classSlot]);
+
+	if (classObj->fieldDefaults != NULL &&
+	    fieldIndex >= 0 && fieldIndex < classObj->numFields)
+	{
+		vm->apiStack[resultSlot] = classObj->fieldDefaults[fieldIndex];
+	}
+	else
+	{
+		vm->apiStack[resultSlot] = NULL_VAL;
+	}
+}
+
+void wrenSetFieldDefault(WrenVM* vm, int classSlot,
+                         int fieldIndex, int valueSlot)
+{
+	validateApiSlot(vm, classSlot);
+	validateApiSlot(vm, valueSlot);
+	ObjClass* classObj = AS_CLASS(vm->apiStack[classSlot]);
+
+	if (fieldIndex < 0 || fieldIndex >= classObj->numFields) return;
+
+	// Lazily allocate the defaults array.
+	if (classObj->fieldDefaults == NULL)
+	{
+		classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);
+		for (int i = 0; i < classObj->numFields; i++)
+			classObj->fieldDefaults[i] = NULL_VAL;
+	}
+
+	classObj->fieldDefaults[fieldIndex] = vm->apiStack[valueSlot];
+}
+
+void wrenGetInstanceField(WrenVM* vm, int instanceSlot,
+                          int fieldIndex, int resultSlot)
+{
+	validateApiSlot(vm, instanceSlot);
+	validateApiSlot(vm, resultSlot);
+	ASSERT(IS_INSTANCE(vm->apiStack[instanceSlot]), "Slot must hold an instance.");
+	ObjInstance* inst = AS_INSTANCE(vm->apiStack[instanceSlot]);
+
+	if (fieldIndex >= 0 && fieldIndex < inst->obj.classObj->numFields)
+		vm->apiStack[resultSlot] = inst->fields[fieldIndex];
+	else
+		vm->apiStack[resultSlot] = NULL_VAL;
+}
+
+void wrenSetInstanceField(WrenVM* vm, int instanceSlot,
+                          int fieldIndex, int valueSlot)
+{
+	validateApiSlot(vm, instanceSlot);
+	validateApiSlot(vm, valueSlot);
+	ASSERT(IS_INSTANCE(vm->apiStack[instanceSlot]), "Slot must hold an instance.");
+	ObjInstance* inst = AS_INSTANCE(vm->apiStack[instanceSlot]);
+
+	if (fieldIndex >= 0 && fieldIndex < inst->obj.classObj->numFields)
+		inst->fields[fieldIndex] = vm->apiStack[valueSlot];
+}
+
+// REVATE EXTENSION: Class attribute introspection.
+void wrenGetClassAttributeMap(WrenVM* vm, int classSlot, int resultSlot)
+{
+	validateApiSlot(vm, classSlot);
+	validateApiSlot(vm, resultSlot);
+	ASSERT(IS_CLASS(vm->apiStack[classSlot]), "Slot must hold a class.");
+
+	ObjClass* classObj = AS_CLASS(vm->apiStack[classSlot]);
+	Value attrs = classObj->attributes;
+
+	// No attributes at all.
+	if (IS_NULL(attrs) || IS_UNDEFINED(attrs))
+	{
+		vm->apiStack[resultSlot] = NULL_VAL;
+		return;
+	}
+
+	// If it's already a raw Map (shouldn't happen normally, but be safe).
+	if (IS_MAP(attrs))
+	{
+		vm->apiStack[resultSlot] = attrs;
+		return;
+	}
+
+	// The normal case: attrs is a ClassAttributes instance whose field[0]
+	// is the class-level attribute Map (the `.self` property).
+	if (IS_INSTANCE(attrs))
+	{
+		ObjInstance* inst = AS_INSTANCE(attrs);
+		if (inst->obj.classObj->numFields > 0)
+		{
+			Value selfMap = inst->fields[0];
+			vm->apiStack[resultSlot] = IS_MAP(selfMap) ? selfMap : NULL_VAL;
+			return;
+		}
+	}
+
+	vm->apiStack[resultSlot] = NULL_VAL;
+}
+
+// REVATE EXTENSION: Map key iteration.
+void wrenGetMapKeys(WrenVM* vm, int mapSlot, int listSlot)
+{
+	validateApiSlot(vm, mapSlot);
+	validateApiSlot(vm, listSlot);
+
+	if (!IS_MAP(vm->apiStack[mapSlot]))
+	{
+		vm->apiStack[listSlot] = NULL_VAL;
+		return;
+	}
+
+	ObjMap* map = AS_MAP(vm->apiStack[mapSlot]);
+	ObjList* list = wrenNewList(vm, 0);
+	vm->apiStack[listSlot] = OBJ_VAL(list);
+
+	for (uint32_t i = 0; i < map->capacity; i++)
+	{
+		if (IS_UNDEFINED(map->entries[i].key)) continue;
+		wrenValueBufferWrite(vm, &list->elements, map->entries[i].key);
+	}
 }

@@ -12,6 +12,7 @@
           &vm->methodNames, name, strlen(name));                               \
       Method method;                                                           \
       method.type = METHOD_PRIMITIVE;                                          \
+      method.isPublic = true;                                                  \
       method.as.primitive = prim_##function;                                   \
       wrenBindMethod(vm, cls, symbol, method);                                 \
     } while (false)
@@ -25,6 +26,7 @@
           &vm->methodNames, name, strlen(name));                               \
       Method method;                                                           \
       method.type = METHOD_FUNCTION_CALL;                                      \
+      method.isPublic = true;                                                  \
       method.as.primitive = prim_##function;                                   \
       wrenBindMethod(vm, cls, symbol, method);                                 \
     } while (false)

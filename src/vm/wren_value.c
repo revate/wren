@@ -51,6 +51,10 @@ ObjClass* wrenNewSingleClass(WrenVM* vm, int numFields, ObjString* name)
   classObj->numFields = numFields;
   classObj->name = name;
   classObj->attributes = NULL_VAL;
+  classObj->isMixin = false;
+  classObj->mixins = NULL;
+  classObj->numMixins = 0;
+  classObj->fieldDefaults = NULL;
 
   wrenPushRoot(vm, (Obj*)classObj);
   wrenMethodBufferInit(&classObj->methods);
@@ -80,6 +84,22 @@ void wrenBindSuperclass(WrenVM* vm, ObjClass* subclass, ObjClass* superclass)
   for (int i = 0; i < superclass->methods.count; i++)
   {
     wrenBindMethod(vm, subclass, i, superclass->methods.data[i]);
+  }
+
+  // REVATE EXTENSION: propagate field defaults from superclass so that mixin
+  // defaults survive inheritance.
+  if (superclass->fieldDefaults != NULL && subclass->numFields > 0)
+  {
+    if (subclass->fieldDefaults == NULL)
+    {
+      subclass->fieldDefaults = ALLOCATE_ARRAY(vm, Value, subclass->numFields);
+      for (int i = 0; i < subclass->numFields; i++)
+        subclass->fieldDefaults[i] = NULL_VAL;
+    }
+    int toCopy = superclass->numFields;
+    if (toCopy > subclass->numFields) toCopy = subclass->numFields;
+    for (int i = 0; i < toCopy; i++)
+      subclass->fieldDefaults[i] = superclass->fieldDefaults[i];
   }
 }
 
@@ -124,12 +144,294 @@ void wrenBindMethod(WrenVM* vm, ObjClass* classObj, int symbol, Method method)
   {
     Method noMethod;
     noMethod.type = METHOD_NONE;
+    noMethod.isPublic = false;
     wrenMethodBufferFill(vm, &classObj->methods, noMethod,
                          symbol - classObj->methods.count + 1);
   }
 
   classObj->methods.data[symbol] = method;
 }
+
+// REVATE EXTENSION ─────────────────────────────────────────────────────────
+// Returns the number of argument bytes that follow the opcode at [ip] in
+// [bytecode].  This is a local copy of the logic in wren_compiler.c – we need
+// it here so that wrenCloneClosureWithFieldOffset can walk bytecode without
+// depending on the static helper in the compiler.
+static int mixinGetArgBytes(const uint8_t* bytecode,
+                            const Value* constants, int ip)
+{
+  Code instruction = (Code)bytecode[ip];
+  switch (instruction)
+  {
+    case CODE_NULL:
+    case CODE_FALSE:
+    case CODE_TRUE:
+    case CODE_POP:
+    case CODE_CLOSE_UPVALUE:
+    case CODE_RETURN:
+    case CODE_END:
+    case CODE_LOAD_LOCAL_0:
+    case CODE_LOAD_LOCAL_1:
+    case CODE_LOAD_LOCAL_2:
+    case CODE_LOAD_LOCAL_3:
+    case CODE_LOAD_LOCAL_4:
+    case CODE_LOAD_LOCAL_5:
+    case CODE_LOAD_LOCAL_6:
+    case CODE_LOAD_LOCAL_7:
+    case CODE_LOAD_LOCAL_8:
+    case CODE_CONSTRUCT:
+    case CODE_FOREIGN_CONSTRUCT:
+    case CODE_FOREIGN_CLASS:
+    case CODE_END_MODULE:
+    case CODE_END_CLASS:
+    case CODE_BIND_MIXIN:
+      return 0;
+
+    case CODE_LOAD_LOCAL:
+    case CODE_STORE_LOCAL:
+    case CODE_LOAD_UPVALUE:
+    case CODE_STORE_UPVALUE:
+    case CODE_LOAD_FIELD_THIS:
+    case CODE_STORE_FIELD_THIS:
+    case CODE_LOAD_FIELD:
+    case CODE_STORE_FIELD:
+    case CODE_CLASS:
+    case CODE_MIXIN:
+    case CODE_FIELD_DEFAULT:
+      return 1;
+
+    case CODE_CONSTANT:
+    case CODE_LOAD_MODULE_VAR:
+    case CODE_STORE_MODULE_VAR:
+    case CODE_CALL_0:
+    case CODE_CALL_1:
+    case CODE_CALL_2:
+    case CODE_CALL_3:
+    case CODE_CALL_4:
+    case CODE_CALL_5:
+    case CODE_CALL_6:
+    case CODE_CALL_7:
+    case CODE_CALL_8:
+    case CODE_CALL_9:
+    case CODE_CALL_10:
+    case CODE_CALL_11:
+    case CODE_CALL_12:
+    case CODE_CALL_13:
+    case CODE_CALL_14:
+    case CODE_CALL_15:
+    case CODE_CALL_16:
+    case CODE_JUMP:
+    case CODE_LOOP:
+    case CODE_JUMP_IF:
+    case CODE_AND:
+    case CODE_OR:
+    case CODE_METHOD_INSTANCE:
+    case CODE_METHOD_STATIC:
+    case CODE_METHOD_INSTANCE_PUBLIC:
+    case CODE_METHOD_STATIC_PUBLIC:
+    case CODE_IMPORT_MODULE:
+    case CODE_IMPORT_VARIABLE:
+      return 2;
+
+    case CODE_SUPER_0:
+    case CODE_SUPER_1:
+    case CODE_SUPER_2:
+    case CODE_SUPER_3:
+    case CODE_SUPER_4:
+    case CODE_SUPER_5:
+    case CODE_SUPER_6:
+    case CODE_SUPER_7:
+    case CODE_SUPER_8:
+    case CODE_SUPER_9:
+    case CODE_SUPER_10:
+    case CODE_SUPER_11:
+    case CODE_SUPER_12:
+    case CODE_SUPER_13:
+    case CODE_SUPER_14:
+    case CODE_SUPER_15:
+    case CODE_SUPER_16:
+      return 4;
+
+    case CODE_CLOSURE:
+    {
+      int constant = (bytecode[ip + 1] << 8) | bytecode[ip + 2];
+      ObjFn* loadedFn = AS_FN(constants[constant]);
+      return 2 + (loadedFn->numUpvalues * 2);
+    }
+  }
+  return 0; // unknown — shouldn't happen
+}
+
+// Deep-copies [srcFn], adding [offset] to every LOAD_FIELD_THIS /
+// STORE_FIELD_THIS / LOAD_FIELD / STORE_FIELD operand.  Recursively patches
+// nested closures found in the constant table.
+static ObjFn* cloneFnWithFieldOffset(WrenVM* vm, ObjFn* srcFn, int offset)
+{
+  ObjFn* newFn = wrenNewFunction(vm, srcFn->module, srcFn->maxSlots);
+  wrenPushRoot(vm, (Obj*)newFn);
+
+  newFn->numUpvalues = srcFn->numUpvalues;
+  newFn->arity       = srcFn->arity;
+
+  // Copy debug name.
+  if (srcFn->debug->name)
+  {
+    int len = (int)strlen(srcFn->debug->name);
+    newFn->debug->name = ALLOCATE_ARRAY(vm, char, len + 1);
+    memcpy(newFn->debug->name, srcFn->debug->name, len + 1);
+  }
+
+  // Copy debug source lines.
+  for (int i = 0; i < srcFn->debug->sourceLines.count; i++)
+    wrenIntBufferWrite(vm, &newFn->debug->sourceLines,
+                       srcFn->debug->sourceLines.data[i]);
+
+  // Copy bytecode.
+  for (int i = 0; i < srcFn->code.count; i++)
+    wrenByteBufferWrite(vm, &newFn->code, srcFn->code.data[i]);
+
+  // Copy constants (deep-clone nested closures).
+  for (int i = 0; i < srcFn->constants.count; i++)
+  {
+    Value c = srcFn->constants.data[i];
+    if (IS_FN(c))
+    {
+      ObjFn* nested = cloneFnWithFieldOffset(vm, AS_FN(c), offset);
+      wrenValueBufferWrite(vm, &newFn->constants, OBJ_VAL(nested));
+    }
+    else
+    {
+      wrenValueBufferWrite(vm, &newFn->constants, c);
+    }
+  }
+
+  // Patch field instructions.
+  for (int ip = 0; ip < newFn->code.count; )
+  {
+    Code inst = (Code)newFn->code.data[ip];
+    switch (inst)
+    {
+      case CODE_LOAD_FIELD_THIS:
+      case CODE_STORE_FIELD_THIS:
+      case CODE_LOAD_FIELD:
+      case CODE_STORE_FIELD:
+        newFn->code.data[ip + 1] += offset;
+        break;
+      default:
+        break;
+    }
+    ip += 1 + mixinGetArgBytes(newFn->code.data, newFn->constants.data, ip);
+  }
+
+  wrenPopRoot(vm);
+  return newFn;
+}
+
+ObjClosure* wrenCloneClosureWithFieldOffset(WrenVM* vm, ObjClosure* src,
+                                            int offset)
+{
+  ObjFn* newFn = cloneFnWithFieldOffset(vm, src->fn, offset);
+  wrenPushRoot(vm, (Obj*)newFn);
+
+  ObjClosure* newClosure = wrenNewClosure(vm, newFn);
+  // Copy upvalues from the source closure.
+  for (int i = 0; i < src->fn->numUpvalues; i++)
+    newClosure->upvalues[i] = src->upvalues[i];
+
+  wrenPopRoot(vm);
+  return newClosure;
+}
+
+#define MAX_MIXINS 16
+
+void wrenBindMixin(WrenVM* vm, ObjClass* classObj, ObjClass* mixin)
+{
+  // 1. Record field offset before adding mixin fields.
+  int fieldOffset = classObj->numFields;
+  classObj->numFields += mixin->numFields;
+
+  // 2. Merge mixin field defaults into host class.
+  if (mixin->fieldDefaults != NULL)
+  {
+    if (classObj->fieldDefaults == NULL)
+    {
+      classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);
+      for (int i = 0; i < classObj->numFields; i++)
+        classObj->fieldDefaults[i] = NULL_VAL;
+    }
+    else
+    {
+      // Grow the existing array to accommodate new fields.
+      Value* old = classObj->fieldDefaults;
+      classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);
+      memcpy(classObj->fieldDefaults, old, fieldOffset * sizeof(Value));
+      for (int i = fieldOffset; i < classObj->numFields; i++)
+        classObj->fieldDefaults[i] = NULL_VAL;
+      DEALLOCATE(vm, old);
+    }
+    // Copy mixin defaults at the offset position.
+    for (int i = 0; i < mixin->numFields; i++)
+      classObj->fieldDefaults[fieldOffset + i] = mixin->fieldDefaults[i];
+  }
+  else if (classObj->fieldDefaults != NULL && mixin->numFields > 0)
+  {
+    // No mixin defaults but host has them — grow with nulls.
+    Value* old = classObj->fieldDefaults;
+    classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);
+    memcpy(classObj->fieldDefaults, old, fieldOffset * sizeof(Value));
+    for (int i = fieldOffset; i < classObj->numFields; i++)
+      classObj->fieldDefaults[i] = NULL_VAL;
+    DEALLOCATE(vm, old);
+  }
+
+  // 3. Copy mixin methods — class's own methods win on conflict.
+  for (int i = 0; i < mixin->methods.count; i++)
+  {
+    Method* mixinMethod = &mixin->methods.data[i];
+    if (mixinMethod->type == METHOD_NONE) continue;
+
+    // If the class already defines this method, the class wins.
+    if (i < classObj->methods.count &&
+        classObj->methods.data[i].type != METHOD_NONE) continue;
+
+    // Clone the method with adjusted field offsets.
+    Method adjusted = *mixinMethod;
+    if (fieldOffset > 0 && adjusted.type == METHOD_BLOCK)
+    {
+      adjusted.as.closure = wrenCloneClosureWithFieldOffset(
+          vm, adjusted.as.closure, fieldOffset);
+    }
+    wrenBindMethod(vm, classObj, i, adjusted);
+  }
+
+  // Also bind mixin metaclass methods (static methods) onto host metaclass.
+  ObjClass* mixinMeta = mixin->obj.classObj;
+  ObjClass* classMeta = classObj->obj.classObj;
+  if (mixinMeta != NULL && classMeta != NULL)
+  {
+    for (int i = 0; i < mixinMeta->methods.count; i++)
+    {
+      Method* mixinMethod = &mixinMeta->methods.data[i];
+      if (mixinMethod->type == METHOD_NONE) continue;
+      if (i < classMeta->methods.count &&
+          classMeta->methods.data[i].type != METHOD_NONE) continue;
+      // Static methods don't access instance fields, no offset needed.
+      wrenBindMethod(vm, classMeta, i, *mixinMethod);
+    }
+  }
+
+  // 3. Store mixin reference for hasMixin() checks.
+  if (classObj->mixins == NULL)
+  {
+    classObj->mixins = ALLOCATE_ARRAY(vm, ObjClass*, MAX_MIXINS);
+    for (int i = 0; i < MAX_MIXINS; i++) classObj->mixins[i] = NULL;
+  }
+  if (classObj->numMixins < MAX_MIXINS)
+  {
+    classObj->mixins[classObj->numMixins++] = mixin;
+  }
+}
+// ─────────────────────────────────────────────────────── end REVATE EXTENSION
 
 ObjClosure* wrenNewClosure(WrenVM* vm, ObjFn* fn)
 {
@@ -274,10 +576,17 @@ Value wrenNewInstance(WrenVM* vm, ObjClass* classObj)
                                         Value, classObj->numFields);
   initObj(vm, &instance->obj, OBJ_INSTANCE, classObj);
 
-  // Initialize fields to null.
-  for (int i = 0; i < classObj->numFields; i++)
+  // REVATE EXTENSION: use class-level field defaults if available.
+  if (classObj->fieldDefaults != NULL)
   {
-    instance->fields[i] = NULL_VAL;
+    for (int i = 0; i < classObj->numFields; i++)
+      instance->fields[i] = classObj->fieldDefaults[i];
+  }
+  else
+  {
+    // Initialize fields to null.
+    for (int i = 0; i < classObj->numFields; i++)
+      instance->fields[i] = NULL_VAL;
   }
 
   return OBJ_VAL(instance);
@@ -1031,9 +1340,26 @@ static void blackenClass(WrenVM* vm, ObjClass* classObj)
 
   if(!IS_NULL(classObj->attributes)) wrenGrayObj(vm, AS_OBJ(classObj->attributes));
 
+  // REVATE EXTENSION: trace mixin pointers.
+  for (int i = 0; i < classObj->numMixins; i++)
+  {
+    wrenGrayObj(vm, (Obj*)classObj->mixins[i]);
+  }
+
+  // REVATE EXTENSION: trace field defaults (may contain strings, etc.).
+  if (classObj->fieldDefaults != NULL)
+  {
+    for (int i = 0; i < classObj->numFields; i++)
+      wrenGrayValue(vm, classObj->fieldDefaults[i]);
+  }
+
   // Keep track of how much memory is still in use.
   vm->bytesAllocated += sizeof(ObjClass);
   vm->bytesAllocated += classObj->methods.capacity * sizeof(Method);
+  if (classObj->mixins != NULL)
+    vm->bytesAllocated += 16 * sizeof(ObjClass*); // MAX_MIXINS
+  if (classObj->fieldDefaults != NULL)
+    vm->bytesAllocated += classObj->numFields * sizeof(Value);
 }
 
 static void blackenClosure(WrenVM* vm, ObjClosure* closure)
@@ -1238,6 +1564,10 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
   {
     case OBJ_CLASS:
       wrenMethodBufferClear(vm, &((ObjClass*)obj)->methods);
+      if (((ObjClass*)obj)->mixins != NULL)
+        DEALLOCATE(vm, ((ObjClass*)obj)->mixins);
+      if (((ObjClass*)obj)->fieldDefaults != NULL)
+        DEALLOCATE(vm, ((ObjClass*)obj)->fieldDefaults);
       break;
 
     case OBJ_FIBER:
