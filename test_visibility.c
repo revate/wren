@@ -784,6 +784,33 @@ int main(void)
     check("hasMixin() works through inheritance",
           result == WREN_RESULT_SUCCESS);
 
+    // Test: independent module/class state across separate VMs
+    printf("\n--- multi-VM isolation ---\n");
+
+    WrenVM* vmA = wrenNewVM(&config);
+    WrenVM* vmB = wrenNewVM(&config);
+
+    lastError[0] = 0;
+    result = wrenInterpret(vmA, "shared",
+        "class Label {\n"
+        "  construct new(name) { _name = name }\n"
+        "  toString { \"A:\" + _name }\n"
+        "}\n"
+        "System.print(Label.new(\"one\"))\n");
+    check("vmA standalone toString works", result == WREN_RESULT_SUCCESS);
+
+    lastError[0] = 0;
+    result = wrenInterpret(vmB, "shared",
+        "class Label {\n"
+        "  construct new(name) { _name = name }\n"
+        "  toString { \"B:\" + _name }\n"
+        "}\n"
+        "System.print(Label.new(\"two\"))\n");
+    check("vmB standalone toString works", result == WREN_RESULT_SUCCESS);
+
+    wrenFreeVM(vmA);
+    wrenFreeVM(vmB);
+
     // ── Summary ──
     printf("\n=== Results: %d passed, %d failed ===\n", testsPassed, testsFailed);
 

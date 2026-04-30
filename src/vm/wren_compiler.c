@@ -3593,9 +3593,14 @@ static bool method(Compiler* compiler, Variable classVariable)
   // Define the method. For a constructor, this defines the instance
   // initializer method.
   // REVATE EXTENSION: constructors, foreign methods, and methods compiled
-  // under defaultPublic mode are always public.
+    // under defaultPublic mode are always public. `System.print` and
+    // `System.write` also need polymorphic access to user-defined `toString`.
+    bool isImplicitToString = signature.type == SIG_GETTER &&
+      signature.length == 8 &&
+      memcmp(signature.name, "toString", 8) == 0;
   bool effectivelyPublic = isPublic || (signature.type == SIG_INITIALIZER)
-      || isForeign || compiler->parser->vm->defaultPublic;
+      || isForeign || compiler->parser->vm->defaultPublic
+      || isImplicitToString;
   defineMethod(compiler, classVariable, isStatic, effectivelyPublic, methodSymbol);
 
   if (signature.type == SIG_INITIALIZER)
