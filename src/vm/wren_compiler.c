@@ -115,6 +115,8 @@ typedef enum
   TOKEN_WITH,
   TOKEN_ENUM,
   TOKEN_AT,
+  TOKEN_SINGLETON,
+  TOKEN_RAW,
 
   TOKEN_FIELD,
   TOKEN_STATIC_FIELD,
@@ -316,7 +318,13 @@ typedef struct
 
   // True if the class being compiled is a foreign class.
   bool isForeign;
-  
+
+  // REVATE EXTENSION: True if the class being compiled is a singleton.
+  // Singletons force every method and var declared in the body to be
+  // static, and reject `construct` blocks.  Same compiled output as a
+  // class whose body only declared `static` members.
+  bool isSingleton;
+
   // True if the current method being compiled is static.
   bool inStatic;
 
@@ -424,12 +432,17 @@ static void copyMethodAttributes(Compiler* compiler, bool isForeign,
             bool isStatic, const char* fullSignature, int32_t length);
 // REVATE EXTENSION: forward declaration for field declarations in class body.
 static bool classField(Compiler* compiler, Variable classVariable, bool isPublic);
+static bool classSingletonField(Compiler* compiler, Variable classVariable,
+                                bool isPublic,
+                                const char* fieldName, int fieldLength);
 // REVATE EXTENSION: forward declaration for typed property declarations.
 static bool typedProperty(Compiler* compiler, Variable classVariable, bool isPublic);
 // REVATE EXTENSION: forward declaration for enum definitions.
 static void enumDefinition(Compiler* compiler);
 // REVATE EXTENSION: forward declaration for mixin definitions.
 static void mixinDefinition(Compiler* compiler);
+// REVATE EXTENSION: forward declaration for singleton definitions.
+static void singletonDefinition(Compiler* compiler);
 
 // The stack effect of each opcode. The index in the array is the opcode, and
 // the value is the stack effect of that instruction.
@@ -647,6 +660,8 @@ static Keyword keywords[] =
   {"mixin",     5, TOKEN_MIXIN},
   {"with",      4, TOKEN_WITH},
   {"enum",      4, TOKEN_ENUM},
+  {"singleton", 9, TOKEN_SINGLETON},
+  {"raw",       3, TOKEN_RAW},
   {NULL,        0, TOKEN_EOF} // Sentinel to mark the end of the array.
 };
 
@@ -2273,6 +2288,121 @@ static ClassInfo* getEnclosingClass(Compiler* compiler)
   return compiler == NULL ? NULL : compiler->enclosingClass;
 }
 
+// REVATE EXTENSION: `raw name` and `raw name = v` — direct read/write of
+// the underlying storage for a `public var` declared in the enclosing
+// class.  Bypasses the auto-generated getter/setter so a custom
+// `name=(v) { … raw name = v }` can set the storage without infinite
+// recursion.
+//
+// In a regular class: looks up the field slot by name and emits
+// LOAD_FIELD_THIS / STORE_FIELD_THIS.
+//
+// In a singleton: looks up the synthesised `__name` storage local
+// (declared at class-body scope by classSingletonField) and emits a
+// LOAD_UPVALUE / STORE_UPVALUE.
+static void rawAccess(Compiler* compiler, bool canAssign)
+{
+  // Consume the field name.
+  consume(compiler, TOKEN_NAME, "Expect field name after 'raw'.");
+  const char* name = compiler->parser->previous.start;
+  int length       = compiler->parser->previous.length;
+
+  ClassInfo* enclosingClass = getEnclosingClass(compiler);
+  if (enclosingClass == NULL)
+  {
+    error(compiler, "Cannot use 'raw' outside of a class definition.");
+    return;
+  }
+  if (enclosingClass->isForeign)
+  {
+    error(compiler, "Cannot use 'raw' in a foreign class.");
+    return;
+  }
+
+  bool isAssign = canAssign && match(compiler, TOKEN_EQ);
+  if (isAssign) expression(compiler);
+
+  // ── Singleton path: resolve the synthesised `__name` upvalue/local ──
+  if (enclosingClass->isSingleton)
+  {
+    if (length > MAX_VARIABLE_NAME - 3)
+    {
+      error(compiler, "Singleton field name is too long.");
+      return;
+    }
+    char storage[MAX_VARIABLE_NAME];
+    storage[0] = '_';
+    storage[1] = '_';
+    memcpy(storage + 2, name, length);
+    int storageLen = length + 2;
+
+    Variable v = resolveName(compiler, storage, storageLen);
+    if (v.index == -1)
+    {
+      error(compiler, "'raw %.*s' has no matching `var` in this singleton.",
+            length, name);
+      return;
+    }
+
+    if (isAssign)
+    {
+      if (v.scope == SCOPE_LOCAL)
+        emitByteArg(compiler, CODE_STORE_LOCAL,   v.index);
+      else if (v.scope == SCOPE_UPVALUE)
+        emitByteArg(compiler, CODE_STORE_UPVALUE, v.index);
+      else
+        emitShortArg(compiler, CODE_STORE_MODULE_VAR, v.index);
+    }
+    else
+    {
+      if (v.scope == SCOPE_LOCAL)
+        emitByteArg(compiler, CODE_LOAD_LOCAL,   v.index);
+      else if (v.scope == SCOPE_UPVALUE)
+        emitByteArg(compiler, CODE_LOAD_UPVALUE, v.index);
+      else
+        emitShortArg(compiler, CODE_LOAD_MODULE_VAR, v.index);
+    }
+
+    allowLineBeforeDot(compiler);
+    return;
+  }
+
+  // ── Regular class: instance-field path ──
+  if (enclosingClass->inStatic)
+  {
+    error(compiler, "Cannot use 'raw %.*s' (an instance field) in a static method.",
+          length, name);
+    return;
+  }
+
+  // Look up the field — must already exist (declared by a prior
+  // `public var name = …`).  We don't auto-create the slot here
+  // because `raw` is for accessing user-declared storage, not for
+  // making new fields.
+  int field = wrenSymbolTableFind(&enclosingClass->fields, name, length);
+  if (field == -1)
+  {
+    error(compiler, "'raw %.*s' has no matching `var` in this class.",
+          length, name);
+    return;
+  }
+
+  if (compiler->parent != NULL &&
+      compiler->parent->enclosingClass == enclosingClass)
+  {
+    emitByteArg(compiler,
+        isAssign ? CODE_STORE_FIELD_THIS : CODE_LOAD_FIELD_THIS, field);
+  }
+  else
+  {
+    loadThis(compiler);
+    emitByteArg(compiler,
+        isAssign ? CODE_STORE_FIELD : CODE_LOAD_FIELD, field);
+  }
+
+  allowLineBeforeDot(compiler);
+}
+
 static void field(Compiler* compiler, bool canAssign)
 {
   // Initialize it with a fake value so we can keep parsing and minimize the
@@ -2843,6 +2973,8 @@ GrammarRule rules[] =
   /* TOKEN_WITH          */ UNUSED,
   /* TOKEN_ENUM          */ UNUSED,
   /* TOKEN_AT            */ UNUSED,
+  /* TOKEN_SINGLETON     */ UNUSED,
+  /* TOKEN_RAW           */ PREFIX(rawAccess),
   /* TOKEN_FIELD         */ PREFIX(field),
   /* TOKEN_STATIC_FIELD  */ PREFIX(staticField),
   /* TOKEN_NAME          */ { name, NULL, namedSignature, PREC_NONE, NULL },
@@ -3524,6 +3656,13 @@ static bool method(Compiler* compiler, Variable classVariable)
 
   bool isForeign = match(compiler, TOKEN_FOREIGN);
   bool isStatic = match(compiler, TOKEN_STATIC);
+
+  // REVATE EXTENSION: inside a singleton, every method is implicitly
+  // static.  Force isStatic = true so the downstream method-emission
+  // paths use METHOD_STATIC / METHOD_STATIC_PUBLIC.
+  if (compiler->enclosingClass->isSingleton)
+    isStatic = true;
+
   compiler->enclosingClass->inStatic = isStatic;
     
   SignatureFn signatureFn = rules[compiler->parser->current.type].method;
@@ -3549,7 +3688,12 @@ static bool method(Compiler* compiler, Variable classVariable)
   
   if (isStatic && signature.type == SIG_INITIALIZER)
   {
-    error(compiler, "A constructor cannot be static.");
+    // REVATE EXTENSION: singletons surface a clearer message —
+    // they have no instances, so a constructor is meaningless.
+    if (compiler->enclosingClass->isSingleton)
+      error(compiler, "A singleton cannot have a constructor.");
+    else
+      error(compiler, "A constructor cannot be static.");
   }
   
   // Include the full signature in debug messages in stack traces.
@@ -3649,6 +3793,17 @@ static bool classField(Compiler* compiler, Variable classVariable, bool isPublic
   // Save the field name.
   const char* fieldName = compiler->parser->previous.start;
   int fieldLength = compiler->parser->previous.length;
+
+  // REVATE EXTENSION: Inside a singleton, every `var` is implicitly
+  // static.  Singleton fields are stored as class-scope locals (the
+  // same scheme plain Wren's `__static_field` syntax uses internally)
+  // and exposed via auto-generated static getter/setter methods.  No
+  // instance-field slot is consumed.
+  if (enclosingClass->isSingleton)
+  {
+    return classSingletonField(compiler, classVariable, isPublic,
+                               fieldName, fieldLength);
+  }
 
   // Allocate a field slot.
   int fieldSlot = wrenSymbolTableEnsure(compiler->parser->vm,
@@ -3751,6 +3906,191 @@ static bool classField(Compiler* compiler, Variable classVariable, bool isPublic
     endCompiler(&setterCompiler, fullSig, sigLen);
 
     defineMethod(compiler, classVariable, false, isPublic, setterSymbol);
+  }
+
+  return true;
+}
+
+// REVATE EXTENSION: singleton field — `[public] var name [= literal]`
+// inside a singleton.  The storage is a class-scope local (captured by
+// each static accessor as an upvalue), and the auto-generated getter /
+// setter are both static-public.  No instance field is allocated.
+//
+// Plain Wren uses `__name` syntax to address class-scope locals from
+// inside a static method (see findUpvalue's "name[0] != '_'" guard —
+// the upvalue walk stops at the class boundary unless the name starts
+// with an underscore).  We exploit that by storing the singleton's
+// state under the synthesised name `__name` even though the user
+// wrote `var name`.  The user never sees the underscore — they read
+// and write through the auto-generated `name` getter/setter.
+static bool classSingletonField(Compiler* compiler, Variable classVariable,
+                                bool isPublic,
+                                const char* fieldName, int fieldLength)
+{
+  // Build the internal storage name: `__` + fieldName.  This makes the
+  // local discoverable through findUpvalue from within static methods
+  // (see findUpvalue's `name[0] != '_'` guard).
+  //
+  // CRITICAL: addLocal() stores the name as a non-owning pointer.  If
+  // we built the storage name on the stack and let it go out of scope,
+  // subsequent compilations of other singleton fields would overwrite
+  // the same stack address and the first field's recorded name would
+  // point at the second field's string.  That was the root cause of
+  // the "Variable is already declared in this scope" bug surfaced by
+  // adjacent singleton vars.
+  //
+  // Fix: intern the storage name in the class's `fields` symbol table.
+  // wrenSymbolTableAdd() copies into a heap-allocated ObjString whose
+  // value pointer remains stable for the lifetime of the class, so
+  // every local entry recorded across the body sees its own name.
+  if (fieldLength > MAX_VARIABLE_NAME - 3)
+  {
+    error(compiler, "Singleton field name is too long.");
+    return false;
+  }
+  char buf[MAX_VARIABLE_NAME];
+  buf[0] = '_';
+  buf[1] = '_';
+  memcpy(buf + 2, fieldName, fieldLength);
+  int storageLen = fieldLength + 2;
+  buf[storageLen] = '\0';
+
+  ClassInfo* enclosingClass = compiler->enclosingClass;
+  int symIdx = wrenSymbolTableAdd(compiler->parser->vm,
+                                  &enclosingClass->fields,
+                                  buf, storageLen);
+  // The interned name pointer is stable for the lifetime of the class.
+  const char* storageName =
+      enclosingClass->fields.data[symIdx]->value;
+
+  // 1. Declare a class-scope local that holds the storage.  This must
+  //    live on the class body's scope (not inside a method) so that
+  //    every static accessor we generate can close over the same
+  //    upvalue.
+  Token storageTok;
+  storageTok.type = TOKEN_NAME;
+  storageTok.start = storageName;
+  storageTok.length = storageLen;
+  storageTok.line = compiler->parser->previous.line;
+  storageTok.value = NULL_VAL;
+  int storage = declareVariable(compiler, &storageTok);
+  (void) storage;
+
+  // 2. Parse `= literal` if present; otherwise default to null.
+  Value defaultVal = NULL_VAL;
+  bool hasDefault = false;
+  if (match(compiler, TOKEN_EQ))
+  {
+    hasDefault = true;
+    if (match(compiler, TOKEN_FALSE))       defaultVal = FALSE_VAL;
+    else if (match(compiler, TOKEN_TRUE))   defaultVal = TRUE_VAL;
+    else if (match(compiler, TOKEN_NULL))   { /* NULL_VAL */ }
+    else if (match(compiler, TOKEN_NUMBER)) defaultVal = compiler->parser->previous.value;
+    else if (match(compiler, TOKEN_STRING)) defaultVal = compiler->parser->previous.value;
+    else
+    {
+      error(compiler, "Singleton var default must be a literal (Num, String, Bool, or null).");
+      nextToken(compiler->parser);
+    }
+  }
+
+  // 3. Initialize the storage local.
+  if (hasDefault)
+    emitConstant(compiler, defaultVal);
+  else
+    emitOp(compiler, CODE_NULL);
+  defineVariable(compiler, storage);
+
+  // 4. Generate the static getter:   static name { __name }
+  {
+    Signature sig;
+    sig.name   = fieldName;
+    sig.length = fieldLength;
+    sig.type   = SIG_GETTER;
+    sig.arity  = 0;
+
+    char fullSig[MAX_METHOD_SIGNATURE];
+    int sigLen;
+    signatureToString(&sig, fullSig, &sigLen);
+
+    int sym = declareMethod(compiler, &sig, fullSig, sigLen);
+
+    Compiler m;
+    initCompiler(&m, compiler->parser, compiler, true);
+
+    Variable v = resolveName(&m, storageName, storageLen);
+    if (v.index == -1)
+    {
+      error(&m, "Singleton storage for '%.*s' is not reachable.",
+            fieldLength, fieldName);
+    }
+    else if (v.scope == SCOPE_LOCAL)
+    {
+      emitByteArg(&m, CODE_LOAD_LOCAL, v.index);
+    }
+    else if (v.scope == SCOPE_UPVALUE)
+    {
+      emitByteArg(&m, CODE_LOAD_UPVALUE, v.index);
+    }
+    else
+    {
+      emitShortArg(&m, CODE_LOAD_MODULE_VAR, v.index);
+    }
+    emitOp(&m, CODE_RETURN);
+
+    endCompiler(&m, fullSig, sigLen);
+
+    defineMethod(compiler, classVariable, /*isStatic=*/ true, isPublic, sym);
+  }
+
+  // 5. Generate the static setter:   static name=(v) { __name = v; return v }
+  {
+    Signature sig;
+    sig.name   = fieldName;
+    sig.length = fieldLength;
+    sig.type   = SIG_SETTER;
+    sig.arity  = 1;
+
+    char fullSig[MAX_METHOD_SIGNATURE];
+    int sigLen;
+    signatureToString(&sig, fullSig, &sigLen);
+
+    int sym = declareMethod(compiler, &sig, fullSig, sigLen);
+
+    Compiler m;
+    initCompiler(&m, compiler->parser, compiler, true);
+
+    // Account for the implicit `v` parameter at local slot 1.
+    m.numLocals++;
+    m.numSlots++;
+
+    Variable v = resolveName(&m, storageName, storageLen);
+
+    emitOp(&m, CODE_LOAD_LOCAL_1);
+
+    if (v.index == -1)
+    {
+      error(&m, "Singleton storage for '%.*s' is not reachable.",
+            fieldLength, fieldName);
+    }
+    else if (v.scope == SCOPE_LOCAL)
+    {
+      emitByteArg(&m, CODE_STORE_LOCAL, v.index);
+    }
+    else if (v.scope == SCOPE_UPVALUE)
+    {
+      emitByteArg(&m, CODE_STORE_UPVALUE, v.index);
+    }
+    else
+    {
+      emitShortArg(&m, CODE_STORE_MODULE_VAR, v.index);
+    }
+
+    emitOp(&m, CODE_RETURN);
+
+    endCompiler(&m, fullSig, sigLen);
+
+    defineMethod(compiler, classVariable, /*isStatic=*/ true, isPublic, sym);
   }
 
   return true;
@@ -4000,6 +4340,7 @@ static void enumDefinition(Compiler* compiler)
   // Set up a temporary ClassInfo so defineMethod/declareMethod work.
   ClassInfo classInfo;
   classInfo.isForeign = false;
+  classInfo.isSingleton = false;
   classInfo.name = className;
   classInfo.classAttributes = NULL;
   classInfo.methodAttributes = NULL;
@@ -4107,6 +4448,7 @@ static void mixinDefinition(Compiler* compiler)
 
   ClassInfo classInfo;
   classInfo.isForeign = false;
+  classInfo.isSingleton = false;
   classInfo.name = className;
 
   classInfo.classAttributes = compiler->attributes->count > 0
@@ -4158,6 +4500,92 @@ static void mixinDefinition(Compiler* compiler)
   compiler->fn->code.data[numFieldsInstruction] =
       (uint8_t)classInfo.fields.count;
   
+  // Clean up.
+  wrenSymbolTableClear(compiler->parser->vm, &classInfo.fields);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.methods);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.staticMethods);
+  compiler->enclosingClass = NULL;
+  popScope(compiler);
+}
+
+// REVATE EXTENSION ─────────────────────────────────────────────────────────
+// Compiles a singleton declaration:
+//
+//   singleton Foo {
+//       public var counter = 0
+//       public increment() { counter = counter + 1 }
+//   }
+//
+// Mechanically a class with all-static members, plus the rule that
+// `construct` is not allowed (singletons have no instances).  Every
+// `var` declaration inside the body is turned into a static storage
+// local + static getter/setter pair by classSingletonField().
+//
+// Emits CODE_CLASS with zero fields — singletons cannot have instance
+// state because they have no instances.
+static void singletonDefinition(Compiler* compiler)
+{
+  // Create a variable to store the singleton class in.
+  Variable classVariable;
+  classVariable.scope = compiler->scopeDepth == -1 ? SCOPE_MODULE : SCOPE_LOCAL;
+  classVariable.index = declareNamedVariable(compiler);
+
+  // Create the class name value.
+  Value classNameString = wrenNewStringLength(compiler->parser->vm,
+      compiler->parser->previous.start, compiler->parser->previous.length);
+  ObjString* className = AS_STRING(classNameString);
+
+  // Push the name string constant for CODE_CLASS.
+  emitConstant(compiler, classNameString);
+
+  // Singletons implicitly inherit from Object.
+  loadCoreVariable(compiler, "Object");
+
+  // Singletons have zero instance fields (all state is static).
+  emitByteArg(compiler, CODE_CLASS, 0);
+
+  // Bind the class to its name in the enclosing scope.
+  defineVariable(compiler, classVariable.index);
+
+  // Push a scope for the body.  Static storage locals live here.
+  pushScope(compiler);
+
+  ClassInfo classInfo;
+  classInfo.isForeign      = false;
+  classInfo.isSingleton    = true;
+  classInfo.name           = className;
+  classInfo.classAttributes  = compiler->attributes->count > 0
+                                 ? wrenNewMap(compiler->parser->vm)
+                                 : NULL;
+  classInfo.methodAttributes = NULL;
+  copyAttributes(compiler, classInfo.classAttributes);
+  wrenSymbolTableInit(&classInfo.fields);
+  wrenIntBufferInit(&classInfo.methods);
+  wrenIntBufferInit(&classInfo.staticMethods);
+  classInfo.numFieldDefaults = 0;
+
+  compiler->enclosingClass = &classInfo;
+
+  consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' after singleton name.");
+  matchLine(compiler);
+
+  while (!match(compiler, TOKEN_RIGHT_BRACE))
+  {
+    if (!method(compiler, classVariable)) break;
+    if (match(compiler, TOKEN_RIGHT_BRACE)) break;
+    consumeLine(compiler, "Expect newline after definition in singleton.");
+  }
+
+  // Emit class-level attributes if any.
+  bool hasAttr = classInfo.classAttributes != NULL ||
+                 classInfo.methodAttributes != NULL;
+  if (hasAttr)
+  {
+    emitClassAttributes(compiler, &classInfo);
+    loadVariable(compiler, classVariable);
+    emitOp(compiler, CODE_END_CLASS);
+  }
+
   // Clean up.
   wrenSymbolTableClear(compiler->parser->vm, &classInfo.fields);
   wrenIntBufferClear(compiler->parser->vm, &classInfo.methods);
@@ -4261,6 +4689,7 @@ static void classDefinition(Compiler* compiler, bool isForeign)
 
   ClassInfo classInfo;
   classInfo.isForeign = isForeign;
+  classInfo.isSingleton = false;
   classInfo.name = className;
 
   // Allocate attribute maps if necessary. 
@@ -4467,6 +4896,12 @@ void definition(Compiler* compiler)
   else if (match(compiler, TOKEN_MIXIN))
   {
     mixinDefinition(compiler);
+    return;
+  }
+  // REVATE EXTENSION: top-level singleton definition
+  else if (match(compiler, TOKEN_SINGLETON))
+  {
+    singletonDefinition(compiler);
     return;
   }
 
