@@ -453,6 +453,29 @@ struct sObjClass
   // instead of NULL_VAL when creating instances.  Populated via
   // CODE_FIELD_DEFAULT and merged during wrenBindMixin / wrenBindSuperclass.
   Value* fieldDefaults;
+
+  // REVATE EXTENSION (§7a): Runtime attachment support.
+  //
+  // `isAttachment` is true for class objects produced by the
+  // `attachment X targets Y { ... }` declaration.  An attachment is a
+  // class-like declaration: instances are constructed with `X.new(...)`
+  // the same way regular classes are, but they additionally carry a
+  // list of "host class names" naming the classes they may be attached
+  // to via `host.attach(...)` (shipped in 7b).
+  //
+  // `attachmentTargets`/`numAttachmentTargets` hold the host class
+  // *names* (as ObjString pointers).  Names rather than ObjClass*
+  // because the target class is permitted to be declared later in the
+  // same module — resolution happens at attach-time (7b), not at
+  // declaration time.  The wildcard form `targets *` is represented as
+  // a single entry whose string content is the literal "*".
+  //
+  // `attachmentTargets` is NULL on every non-attachment class.  On an
+  // attachment class it is always a non-NULL, heap-allocated array
+  // sized `numAttachmentTargets`.
+  bool isAttachment;
+  ObjString** attachmentTargets;
+  int numAttachmentTargets;
 };
 
 typedef struct

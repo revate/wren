@@ -119,6 +119,8 @@ typedef enum
   TOKEN_RAW,
   // REVATE EXTENSION (§6b): `my.MixinName.foo(...)` mixin-namespace access.
   TOKEN_MY,
+  // REVATE EXTENSION (§7a): `attachment Name targets X { ... }`.
+  TOKEN_ATTACHMENT,
 
   TOKEN_FIELD,
   TOKEN_STATIC_FIELD,
@@ -341,6 +343,13 @@ typedef struct
   // plain identifiers).
   bool isMixin;
 
+  // REVATE EXTENSION (§7a): True if the body being compiled is an
+  // `attachment` declaration.  Used so future phases (host.attach in
+  // 7b, default attachments block in 7c, modifier hooks in 8) can
+  // adjust their behaviour; for 7a itself the flag is informational
+  // and parallels the existing `isMixin` discriminator on ClassInfo.
+  bool isAttachment;
+
   // True if the current method being compiled is static.
   bool inStatic;
 
@@ -510,6 +519,8 @@ static bool typedProperty(Compiler* compiler, Variable classVariable, bool isPub
 static void enumDefinition(Compiler* compiler);
 // REVATE EXTENSION: forward declaration for mixin definitions.
 static void mixinDefinition(Compiler* compiler);
+// REVATE EXTENSION (§7a): forward declaration for attachment definitions.
+static void attachmentDefinition(Compiler* compiler);
 // REVATE EXTENSION: forward declaration for singleton definitions.
 static void singletonDefinition(Compiler* compiler);
 
@@ -732,6 +743,11 @@ static Keyword keywords[] =
   {"singleton", 9, TOKEN_SINGLETON},
   {"raw",       3, TOKEN_RAW},
   {"my",        2, TOKEN_MY},
+  // REVATE EXTENSION (§7a): `attachment` is reserved at module scope.
+  // `targets` stays context-sensitive (recognised as a bare NAME only
+  // after `attachment Name`) so it remains a usable identifier outside
+  // an attachment declaration head.
+  {"attachment",10, TOKEN_ATTACHMENT},
   {NULL,        0, TOKEN_EOF} // Sentinel to mark the end of the array.
 };
 
@@ -3203,6 +3219,7 @@ GrammarRule rules[] =
   /* TOKEN_SINGLETON     */ UNUSED,
   /* TOKEN_RAW           */ PREFIX(rawAccess),
   /* TOKEN_MY            */ PREFIX(my_),
+  /* TOKEN_ATTACHMENT    */ UNUSED, // REVATE EXTENSION (§7a): module-level decl.
   /* TOKEN_FIELD         */ PREFIX(field),
   /* TOKEN_STATIC_FIELD  */ PREFIX(staticField),
   /* TOKEN_NAME          */ { name, NULL, namedSignature, PREC_NONE, NULL },
@@ -4017,9 +4034,31 @@ static bool method(Compiler* compiler, Variable classVariable)
     bool isImplicitToString = signature.type == SIG_GETTER &&
       signature.length == 8 &&
       memcmp(signature.name, "toString", 8) == 0;
+  // REVATE EXTENSION (§7a): inside an attachment body, the three
+  // lifecycle hooks `onAttached(_)`, `onDetached(_)`, and
+  // `onHostDestroyed(_)` are implicitly public.  The 7b host.attach()
+  // / host.detach() machinery dispatches them from outside the
+  // attachment instance, so a private hook would be unreachable.
+  // Phase 7a needs the implicit-public mark in place so direct
+  // invocation in tests (the kickoff explicitly calls this out) works
+  // without forcing the user to write `public onAttached(_)`.
+  bool isImplicitAttachmentHook = false;
+  if (compiler->enclosingClass != NULL &&
+      compiler->enclosingClass->isAttachment &&
+      signature.type == SIG_METHOD && signature.arity == 1 && !isStatic)
+  {
+    isImplicitAttachmentHook =
+        (signature.length == 10 &&
+         memcmp(signature.name, "onAttached", 10) == 0) ||
+        (signature.length == 10 &&
+         memcmp(signature.name, "onDetached", 10) == 0) ||
+        (signature.length == 15 &&
+         memcmp(signature.name, "onHostDestroyed", 15) == 0);
+  }
   bool effectivelyPublic = isPublic || (signature.type == SIG_INITIALIZER)
       || isForeign || compiler->parser->vm->defaultPublic
-      || isImplicitToString;
+      || isImplicitToString
+      || isImplicitAttachmentHook;
   defineMethod(compiler, classVariable, isStatic, effectivelyPublic, methodSymbol);
 
   if (signature.type == SIG_INITIALIZER)
@@ -4617,6 +4656,7 @@ static void enumDefinition(Compiler* compiler)
   classInfo.isForeign = false;
   classInfo.isSingleton = false;
   classInfo.isMixin = false; // §6b
+  classInfo.isAttachment = false; // §7a
   classInfo.name = className;
   classInfo.classAttributes = NULL;
   classInfo.methodAttributes = NULL;
@@ -4726,6 +4766,7 @@ static void mixinDefinition(Compiler* compiler)
   classInfo.isForeign = false;
   classInfo.isSingleton = false;
   classInfo.isMixin = true; // §6b: this is a `mixin Name { ... }` body
+  classInfo.isAttachment = false; // §7a
   classInfo.name = className;
 
   classInfo.classAttributes = compiler->attributes->count > 0
@@ -4792,6 +4833,313 @@ static void mixinDefinition(Compiler* compiler)
   popScope(compiler);
 }
 
+// REVATE EXTENSION (§7a) ───────────────────────────────────────────────────
+// Compiles an attachment declaration:
+//
+//   attachment Name targets Host1, Host2 { ... }
+//   attachment Name targets *           { ... }
+//
+// Shape mirrors mixinDefinition() with these differences:
+//   1. The `targets` clause is mandatory.  Empty lists and missing
+//      clauses are compile errors.  Wildcard `*` is permitted as a
+//      sentinel and stored as the literal string "*".
+//   2. Emits CODE_ATTACHMENT (not CODE_CLASS / CODE_MIXIN) — sets
+//      classObj->isAttachment = true at runtime.
+//   3. Per target, emits CODE_ATTACHMENT_TARGET <nameConst:short> which
+//      appends the name (as ObjString*) onto the runtime class's
+//      attachmentTargets[] array.  Names are stored (not ObjClass*)
+//      because forward references are accepted — the target class may
+//      be declared later in the same module; resolution happens at
+//      attach time (7b).
+//   4. An implicit `host` field is synthesised at slot 0 BEFORE any
+//      user-declared fields, plus a public `host` getter returning
+//      that slot.  The actual attach machinery (7b) writes/clears
+//      that slot; for 7a it stays null and `this.host` reads as null.
+//   5. No superclass clause (`is`) and no `with` clause — attachments
+//      inherit from Object implicitly and cannot compose mixins (the
+//      design intentionally separates per-class mixin composition
+//      from per-instance attachment composition).
+//
+// Lifecycle hooks (onAttached(_) / onDetached(_) / onHostDestroyed(_))
+// parse and bind as ordinary methods.  7a treats them as user-visible
+// methods that the host machinery will invoke once 7b ships; for 7a
+// itself they can be invoked directly on an instance.
+static void attachmentDefinition(Compiler* compiler)
+{
+  // Create a variable to store the attachment in.
+  Variable classVariable;
+  classVariable.scope = compiler->scopeDepth == -1 ? SCOPE_MODULE : SCOPE_LOCAL;
+  classVariable.index = declareNamedVariable(compiler);
+
+  // Create shared class name value.
+  Value classNameString = wrenNewStringLength(compiler->parser->vm,
+      compiler->parser->previous.start, compiler->parser->previous.length);
+  ObjString* className = AS_STRING(classNameString);
+
+  // Make a string constant for the name.
+  emitConstant(compiler, classNameString);
+
+  // Implicitly inherit from Object (attachments have no superclass clause).
+  loadCoreVariable(compiler, "Object");
+
+  // ── targets clause ──
+  //
+  // `targets` is context-sensitive: it's parsed here as a bare
+  // identifier rather than a global keyword so it stays a usable
+  // identifier in unrelated code (mirrors how `defaults` works in
+  // class bodies).
+  if (peek(compiler) != TOKEN_NAME ||
+      compiler->parser->current.length != 7 ||
+      memcmp(compiler->parser->current.start, "targets", 7) != 0)
+  {
+    error(compiler,
+          "Expect 'targets' after attachment name.");
+  }
+  else
+  {
+    nextToken(compiler->parser);  // consume `targets`
+  }
+
+  // Parse the comma-separated target list.  Each entry is either a
+  // bare NAME (host class name) or `*` (wildcard).  Empty list is an
+  // error.
+  #define MAX_ATTACHMENT_TARGETS 16
+  Value targetNameValues[MAX_ATTACHMENT_TARGETS];
+  int numTargets = 0;
+  bool firstTarget = true;
+  while (true)
+  {
+    if (!firstTarget)
+    {
+      if (!match(compiler, TOKEN_COMMA)) break;
+    }
+    firstTarget = false;
+
+    if (match(compiler, TOKEN_STAR))
+    {
+      // Wildcard target — stored as the literal sentinel "*".
+      if (numTargets < MAX_ATTACHMENT_TARGETS)
+      {
+        targetNameValues[numTargets++] =
+            wrenNewStringLength(compiler->parser->vm, "*", 1);
+      }
+      else
+      {
+        error(compiler,
+              "An attachment cannot list more than %d targets.",
+              MAX_ATTACHMENT_TARGETS);
+      }
+    }
+    else if (peek(compiler) == TOKEN_NAME)
+    {
+      nextToken(compiler->parser);
+      if (numTargets < MAX_ATTACHMENT_TARGETS)
+      {
+        targetNameValues[numTargets++] = wrenNewStringLength(
+            compiler->parser->vm,
+            compiler->parser->previous.start,
+            compiler->parser->previous.length);
+      }
+      else
+      {
+        error(compiler,
+              "An attachment cannot list more than %d targets.",
+              MAX_ATTACHMENT_TARGETS);
+      }
+    }
+    else
+    {
+      error(compiler,
+            "Expect target class name (or '*') after 'targets'.");
+      break;
+    }
+  }
+
+  if (numTargets == 0)
+  {
+    error(compiler,
+          "An attachment must list at least one target after 'targets'.");
+  }
+
+  // ── Emit CODE_ATTACHMENT (numFields placeholder) ──
+  //
+  // The field count is patched in once the body has been compiled and
+  // we know the final fields-table size.  Note that the implicit
+  // `host` field at slot 0 is registered BEFORE we descend into the
+  // body so it occupies slot 0; this guarantees that any user fields
+  // declared in the body land at slot 1+ regardless of declaration
+  // order.
+  int numFieldsInstruction = emitByteArg(compiler, CODE_ATTACHMENT, 255);
+
+  // Store the attachment in its name slot.
+  defineVariable(compiler, classVariable.index);
+
+  // Emit one CODE_ATTACHMENT_TARGET per target.  The class sits on
+  // top of the stack throughout: each ATTACHMENT_TARGET reads it via
+  // PEEK and leaves it in place.
+  for (int i = 0; i < numTargets; i++)
+  {
+    loadVariable(compiler, classVariable);
+    int nameConst = addConstant(compiler, targetNameValues[i]);
+    emitShortArg(compiler, CODE_ATTACHMENT_TARGET, nameConst);
+    emitOp(compiler, CODE_POP);
+  }
+
+  // Push a scope for the attachment body.
+  pushScope(compiler);
+
+  ClassInfo classInfo;
+  classInfo.isForeign      = false;
+  classInfo.isSingleton    = false;
+  classInfo.isMixin        = false;
+  classInfo.isAttachment   = true;
+  classInfo.name           = className;
+  classInfo.classAttributes  = compiler->attributes->count > 0
+                                 ? wrenNewMap(compiler->parser->vm)
+                                 : NULL;
+  classInfo.methodAttributes = NULL;
+  copyAttributes(compiler, classInfo.classAttributes);
+
+  wrenSymbolTableInit(&classInfo.fields);
+  wrenIntBufferInit(&classInfo.methods);
+  wrenIntBufferInit(&classInfo.staticMethods);
+  classInfo.numFieldDefaults = 0;
+  classInfo.numWithMixins      = 0;
+  classInfo.numPendingOverrides = 0;
+  classInfo.numOverrideMethods  = 0;
+  compiler->enclosingClass = &classInfo;
+
+  // ── Synthesise the implicit `host` field at slot 0. ──
+  //
+  // Attachments expose `this.host` as the host they're currently
+  // attached to.  7a reserves the slot; 7b's attach()/detach() machinery
+  // writes/clears it.  The slot defaults to NULL_VAL via the regular
+  // wrenNewInstance path (no fieldDefaults entry is recorded), so
+  // reading `this.host` from a freshly-constructed attachment with no
+  // host yields null.
+  //
+  // We register the symbol first so it occupies slot 0 — every
+  // user-declared field then lands at slot 1+ regardless of source
+  // order.  A public `host` getter is synthesised so external code
+  // (the 7b host.attach machinery) can also use the normal method
+  // path; for now within the attachment body `this.host` resolves
+  // through the same getter.
+  int hostFieldSlot = wrenSymbolTableEnsure(compiler->parser->vm,
+      &classInfo.fields, "host", 4);
+  ASSERT(hostFieldSlot == 0, "Implicit 'host' field must occupy slot 0.");
+
+  // Synthesise the `host` getter:  host { return _host }
+  // (private storage — exposed only through this getter).
+  {
+    Signature getterSig;
+    getterSig.name = "host";
+    getterSig.length = 4;
+    getterSig.type = SIG_GETTER;
+    getterSig.arity = 0;
+
+    char fullSig[MAX_METHOD_SIGNATURE];
+    int sigLen;
+    signatureToString(&getterSig, fullSig, &sigLen);
+
+    int getterSymbol = declareMethod(compiler, &getterSig, fullSig, sigLen);
+
+    Compiler getterCompiler;
+    initCompiler(&getterCompiler, compiler->parser, compiler, true);
+
+    emitByteArg(&getterCompiler, CODE_LOAD_FIELD_THIS, hostFieldSlot);
+    emitOp(&getterCompiler, CODE_RETURN);
+
+    endCompiler(&getterCompiler, fullSig, sigLen);
+
+    // public so the 7b machinery can also read `att.host` externally
+    // if it ever needs to.
+    defineMethod(compiler, classVariable, /*isStatic*/ false,
+                 /*isPublic*/ true, getterSymbol);
+  }
+
+  // Synthesise the `host=(v)` setter — used by 7b's attach/detach
+  // machinery to set/clear the slot.  Marked public so the C-side
+  // attach machinery in 7b can write through normal method dispatch.
+  {
+    Signature setterSig;
+    setterSig.name = "host";
+    setterSig.length = 4;
+    setterSig.type = SIG_SETTER;
+    setterSig.arity = 1;
+
+    char fullSig[MAX_METHOD_SIGNATURE];
+    int sigLen;
+    signatureToString(&setterSig, fullSig, &sigLen);
+
+    int setterSymbol = declareMethod(compiler, &setterSig, fullSig, sigLen);
+
+    Compiler setterCompiler;
+    initCompiler(&setterCompiler, compiler->parser, compiler, true);
+
+    // The setter parameter is local slot 1 (slot 0 = this).
+    setterCompiler.numLocals++;
+    setterCompiler.numSlots++;
+
+    emitOp(&setterCompiler, CODE_LOAD_LOCAL_1);
+    emitByteArg(&setterCompiler, CODE_STORE_FIELD_THIS, hostFieldSlot);
+    emitOp(&setterCompiler, CODE_RETURN);
+
+    endCompiler(&setterCompiler, fullSig, sigLen);
+
+    defineMethod(compiler, classVariable, /*isStatic*/ false,
+                 /*isPublic*/ true, setterSymbol);
+  }
+
+  // ── Compile the body ──
+  consume(compiler, TOKEN_LEFT_BRACE,
+          "Expect '{' after attachment 'targets' clause.");
+  matchLine(compiler);
+
+  while (!match(compiler, TOKEN_RIGHT_BRACE))
+  {
+    if (!method(compiler, classVariable)) break;
+    if (match(compiler, TOKEN_RIGHT_BRACE)) break;
+    consumeLine(compiler, "Expect newline after definition in attachment.");
+  }
+
+  // Emit class attributes if any (e.g. `@serialize` annotations on
+  // the attachment declaration itself).
+  bool hasAttr = classInfo.classAttributes != NULL ||
+                 classInfo.methodAttributes != NULL;
+  if (hasAttr)
+  {
+    emitClassAttributes(compiler, &classInfo);
+    loadVariable(compiler, classVariable);
+    emitOp(compiler, CODE_END_CLASS);
+  }
+
+  // Field defaults emitted the same way mixins do.  The implicit
+  // `host` slot never gets a default (left as NULL_VAL).
+  if (classInfo.numFieldDefaults > 0)
+  {
+    loadVariable(compiler, classVariable);
+    for (int i = 0; i < classInfo.numFieldDefaults; i++)
+    {
+      emitConstant(compiler, classInfo.fieldDefaultValue[i]);
+      emitByteArg(compiler, CODE_FIELD_DEFAULT, classInfo.fieldDefaultSlot[i]);
+    }
+    emitOp(compiler, CODE_POP);
+  }
+
+  // Patch the field count.
+  compiler->fn->code.data[numFieldsInstruction] =
+      (uint8_t)classInfo.fields.count;
+
+  // Clean up.
+  wrenSymbolTableClear(compiler->parser->vm, &classInfo.fields);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.methods);
+  wrenIntBufferClear(compiler->parser->vm, &classInfo.staticMethods);
+  compiler->enclosingClass = NULL;
+  popScope(compiler);
+
+  #undef MAX_ATTACHMENT_TARGETS
+}
+
 // REVATE EXTENSION ─────────────────────────────────────────────────────────
 // Compiles a singleton declaration:
 //
@@ -4838,6 +5186,7 @@ static void singletonDefinition(Compiler* compiler)
   classInfo.isForeign      = false;
   classInfo.isSingleton    = true;
   classInfo.isMixin        = false; // §6b
+  classInfo.isAttachment   = false; // §7a
   classInfo.name           = className;
   classInfo.classAttributes  = compiler->attributes->count > 0
                                  ? wrenNewMap(compiler->parser->vm)
@@ -5104,6 +5453,7 @@ static void classDefinition(Compiler* compiler, bool isForeign)
   classInfo.isForeign = isForeign;
   classInfo.isSingleton = false;
   classInfo.isMixin = false; // §6b
+  classInfo.isAttachment = false; // §7a
   classInfo.name = className;
 
   // Allocate attribute maps if necessary.
@@ -5388,6 +5738,12 @@ void definition(Compiler* compiler)
   else if (match(compiler, TOKEN_MIXIN))
   {
     mixinDefinition(compiler);
+    return;
+  }
+  // REVATE EXTENSION (§7a): top-level attachment definition.
+  else if (match(compiler, TOKEN_ATTACHMENT))
+  {
+    attachmentDefinition(compiler);
     return;
   }
   // REVATE EXTENSION: top-level singleton definition

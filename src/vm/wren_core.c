@@ -55,6 +55,28 @@ DEF_PRIMITIVE(class_attributes)
   RETURN_VAL(AS_CLASS(args[0])->attributes);
 }
 
+// REVATE EXTENSION (§7a): expose the isAttachment flag and the
+// attachmentTargets[] name array as introspection primitives so tests
+// (and 7b's attach() machinery) can identify attachment classes.
+DEF_PRIMITIVE(class_isAttachment)
+{
+  RETURN_BOOL(AS_CLASS(args[0])->isAttachment);
+}
+
+DEF_PRIMITIVE(class_attachmentTargets)
+{
+  ObjClass* classObj = AS_CLASS(args[0]);
+  ObjList* list = wrenNewList(vm, 0);
+  wrenPushRoot(vm, (Obj*)list);
+  for (int i = 0; i < classObj->numAttachmentTargets; i++)
+  {
+    wrenValueBufferWrite(vm, &list->elements,
+                         OBJ_VAL(classObj->attachmentTargets[i]));
+  }
+  wrenPopRoot(vm);
+  RETURN_OBJ(list);
+}
+
 DEF_PRIMITIVE(fiber_new)
 {
   if (!validateFn(vm, args[1], "Argument")) return false;
@@ -1284,6 +1306,9 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->classClass, "supertype", class_supertype);
   PRIMITIVE(vm->classClass, "toString", class_toString);
   PRIMITIVE(vm->classClass, "attributes", class_attributes);
+  // REVATE EXTENSION (§7a): runtime attachment introspection.
+  PRIMITIVE(vm->classClass, "isAttachment", class_isAttachment);
+  PRIMITIVE(vm->classClass, "attachmentTargets", class_attachmentTargets);
 
   // Finally, we can define Object's metaclass which is a subclass of Class.
   ObjClass* objectMetaclass = defineClass(vm, coreModule, "Object metaclass");

@@ -297,6 +297,29 @@ OPCODE(STORE_MIXIN_FIELD_THIS, 0)
 // CODE_MIXIN_FIELD_DEFAULT emissions can target the same class.
 OPCODE(MIXIN_FIELD_DEFAULT, -1)
 
+// REVATE EXTENSION (§7a): Creates an attachment class.  Same shape as
+// CLASS but sets isAttachment = true on the resulting ObjClass.  Used by
+// `attachment X targets Y { ... }` declarations.  Byte [arg] is the
+// number of fields in the attachment (already includes the implicit
+// `host` field at slot 0).
+//
+// Stack: ..., name, superclass → ..., class
+OPCODE(ATTACHMENT, -1)
+
+// REVATE EXTENSION (§7a): Appends a single target-class name string to
+// the attachment class's `attachmentTargets[]` array.  Emitted once per
+// entry in the `targets X, Y, ...` clause, after CODE_ATTACHMENT but
+// before any method binding.  The wildcard `targets *` form emits a
+// single ATTACHMENT_TARGET whose name string is "*".
+//
+// Stack: ..., class → ..., class  (leaves the class for chaining)
+//
+// Operand: nameConst (short) — constant-pool index of the target's
+// ObjString name.  Storing the string (not an ObjClass pointer) lets
+// the target be declared later in the module; resolution happens at
+// attach-time (7b), not at declaration time.
+OPCODE(ATTACHMENT_TARGET, 0)
+
 // REVATE EXTENSION (§6a): Validates @override(MixinName) annotations and
 // emits compile-time warnings for unannotated shadows of mixin methods.
 //

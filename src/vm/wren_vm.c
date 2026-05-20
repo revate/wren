@@ -1934,6 +1934,49 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       DISPATCH();
     }
 
+    // REVATE EXTENSION (§7a): identical to CLASS but marks the result as
+    // an attachment.  The class shape (fields, methods, constructors)
+    // is the same as a regular class; the only difference is the
+    // `isAttachment` flag and the per-target name list populated by
+    // subsequent CODE_ATTACHMENT_TARGET ops.
+    CASE_CODE(ATTACHMENT):
+    {
+      createClass(vm, READ_BYTE(), NULL);
+      if (wrenHasError(fiber)) RUNTIME_ERROR();
+      AS_CLASS(fiber->stackTop[-1])->isAttachment = true;
+      DISPATCH();
+    }
+
+    // REVATE EXTENSION (§7a): append one target-class name to the
+    // attachment class on top of the stack.  The class is left in
+    // place so a series of these can chain.  Reallocates the
+    // attachmentTargets array geometrically — attachments rarely list
+    // more than a handful of targets, so a doubling growth strategy is
+    // overkill; we simply grow by one each call, which is amortised
+    // fine for the typical 1-3 target case.
+    CASE_CODE(ATTACHMENT_TARGET):
+    {
+      uint16_t nameConst = READ_SHORT();
+      ObjClass* classObj = AS_CLASS(PEEK());
+      ASSERT(classObj->isAttachment,
+             "CODE_ATTACHMENT_TARGET on a non-attachment class.");
+      Value nameVal = fn->constants.data[nameConst];
+      ASSERT(IS_STRING(nameVal),
+             "CODE_ATTACHMENT_TARGET nameConst must be a string.");
+      ObjString* nameStr = AS_STRING(nameVal);
+
+      int newCount = classObj->numAttachmentTargets + 1;
+      ObjString** newArr = ALLOCATE_ARRAY(vm, ObjString*, newCount);
+      for (int i = 0; i < classObj->numAttachmentTargets; i++)
+        newArr[i] = classObj->attachmentTargets[i];
+      newArr[newCount - 1] = nameStr;
+      if (classObj->attachmentTargets != NULL)
+        DEALLOCATE(vm, classObj->attachmentTargets);
+      classObj->attachmentTargets   = newArr;
+      classObj->numAttachmentTargets = newCount;
+      DISPATCH();
+    }
+
     CASE_CODE(FOREIGN_CLASS):
     {
       createClass(vm, -1, fn->module);

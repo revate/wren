@@ -307,6 +307,22 @@ static int dumpInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     }
     case CODE_BIND_MIXIN: printf("BIND_MIXIN\n"); break;
 
+    // REVATE EXTENSION (§7a): attachment declarations.
+    case CODE_ATTACHMENT:
+    {
+      int numFields = READ_BYTE();
+      printf("%-16s %5d fields\n", "ATTACHMENT", numFields);
+      break;
+    }
+    case CODE_ATTACHMENT_TARGET:
+    {
+      int nameConst = READ_SHORT();
+      printf("%-16s '", "ATT_TARGET");
+      wrenDumpValue(fn->constants.data[nameConst]);
+      printf("'\n");
+      break;
+    }
+
     case CODE_VALIDATE_OVERRIDES: printf("VALIDATE_OVERRIDES\n"); break;
 
     // REVATE EXTENSION (§6b): my.MixinName.method(args) dispatch.

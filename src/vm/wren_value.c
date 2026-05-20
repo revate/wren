@@ -58,6 +58,10 @@ ObjClass* wrenNewSingleClass(WrenVM* vm, int numFields, ObjString* name)
   // REVATE EXTENSION (§6b): per-mixin offset / method tables for my.X
   classObj->mixinFieldOffsets = NULL;
   classObj->mixinMethods      = NULL;
+  // REVATE EXTENSION (§7a): attachment declaration metadata.
+  classObj->isAttachment        = false;
+  classObj->attachmentTargets   = NULL;
+  classObj->numAttachmentTargets = 0;
 
   wrenPushRoot(vm, (Obj*)classObj);
   wrenMethodBufferInit(&classObj->methods);
@@ -201,6 +205,7 @@ static int mixinGetArgBytes(const uint8_t* bytecode,
     case CODE_STORE_FIELD:
     case CODE_CLASS:
     case CODE_MIXIN:
+    case CODE_ATTACHMENT:
     case CODE_FIELD_DEFAULT:
       return 1;
 
@@ -235,6 +240,7 @@ static int mixinGetArgBytes(const uint8_t* bytecode,
     case CODE_METHOD_STATIC_PUBLIC:
     case CODE_IMPORT_MODULE:
     case CODE_IMPORT_VARIABLE:
+    case CODE_ATTACHMENT_TARGET:
       return 2;
 
     // REVATE EXTENSION (§6b): my.MixinName.field / my.MixinName.method.
@@ -1458,6 +1464,13 @@ static void blackenClass(WrenVM* vm, ObjClass* classObj)
       wrenGrayValue(vm, classObj->fieldDefaults[i]);
   }
 
+  // REVATE EXTENSION (§7a): trace attachment target name strings.
+  if (classObj->attachmentTargets != NULL)
+  {
+    for (int i = 0; i < classObj->numAttachmentTargets; i++)
+      wrenGrayObj(vm, (Obj*)classObj->attachmentTargets[i]);
+  }
+
   // Keep track of how much memory is still in use.
   vm->bytesAllocated += sizeof(ObjClass);
   vm->bytesAllocated += classObj->methods.capacity * sizeof(Method);
@@ -1473,6 +1486,8 @@ static void blackenClass(WrenVM* vm, ObjClass* classObj)
   }
   if (classObj->fieldDefaults != NULL)
     vm->bytesAllocated += classObj->numFields * sizeof(Value);
+  if (classObj->attachmentTargets != NULL)
+    vm->bytesAllocated += classObj->numAttachmentTargets * sizeof(ObjString*);
 }
 
 static void blackenClosure(WrenVM* vm, ObjClosure* closure)
@@ -1691,6 +1706,9 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
       }
       if (((ObjClass*)obj)->fieldDefaults != NULL)
         DEALLOCATE(vm, ((ObjClass*)obj)->fieldDefaults);
+      // REVATE EXTENSION (§7a): release attachment target name array.
+      if (((ObjClass*)obj)->attachmentTargets != NULL)
+        DEALLOCATE(vm, ((ObjClass*)obj)->attachmentTargets);
       break;
 
     case OBJ_FIBER:
