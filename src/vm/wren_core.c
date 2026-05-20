@@ -1579,6 +1579,31 @@ DEF_PRIMITIVE(object_detachSelf)
   return dispatchOnDetached(vm, args, att, hostVal);
 }
 
+// REVATE EXTENSION (§7c) ─────────────────────────────────────────────
+// `<defaultAttach>()` — the no-op default-attachment hook bound on
+// `vm->objectClass`.  Every class inherits this; classes that declare
+// a `default attachments { ... }` block override it with a synthesised
+// Wren-level body that runs `super.<defaultAttach>()` first and then
+// performs one `this.attach(EntryClass.new(...))` per block entry.
+//
+// The bracketed `<defaultAttach>` signature is unreachable from user
+// Wren code (Wren's lexer refuses to start an identifier with `<`),
+// so this primitive is dispatched only by the constructor allocator
+// the compiler emits — see `createConstructor` in wren_compiler.c.
+//
+// Contract: the primitive returns the receiver unchanged.  The
+// constructor allocator emits `CODE_CALL_0 <defaultAttach()>` after
+// the user's initializer returns, so the call replaces slot 0 with
+// the return value; by returning the receiver here we leave the
+// instance in slot 0 for the trailing `CODE_RETURN`.
+DEF_PRIMITIVE(object_defaultAttach)
+{
+  // No-op: return receiver.  args[0] is already the instance, so
+  // RETURN_VAL(args[0]) is a tautology but kept explicit for clarity.
+  RETURN_VAL(args[0]);
+}
+// ─────────────────────────────────────────────── end REVATE EXTENSION
+
 DEF_PRIMITIVE(range_from)
 {
   RETURN_NUM(AS_RANGE(args[0])->from);
@@ -1949,6 +1974,15 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->objectClass, "attachments(_)",   object_attachmentsOfClass);
   PRIMITIVE(vm->objectClass, "attachments",      object_attachmentsAll);
   PRIMITIVE(vm->objectClass, "detach()",         object_detachSelf);
+
+  // REVATE EXTENSION (§7c): default-attachment hook bound on Object
+  // as a no-op that returns its receiver.  Classes that declare
+  // `default attachments { ... }` override this with a synthesised
+  // Wren-level method.  The constructor allocator emitted by
+  // createConstructor invokes it unconditionally at the end of every
+  // `Class.new(...)`; the no-op default keeps the cost at one extra
+  // primitive call per construction for classes that don't opt in.
+  PRIMITIVE(vm->objectClass, "<defaultAttach>()", object_defaultAttach);
 
   // Now we can define Class, which is a subclass of Object.
   vm->classClass = defineClass(vm, coreModule, "Class");

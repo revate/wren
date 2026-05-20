@@ -3698,6 +3698,18 @@ void statement(Compiler* compiler)
 //     CODE_CONSTRUCT - Replace the class in slot 0 with a new instance of it.
 //     CODE_CALL      - Invoke the initializer on the new instance.
 //
+// REVATE EXTENSION (§7c): the allocator additionally invokes the
+// `<defaultAttach>()` method on the freshly-initialised instance.
+// Every class inherits a no-op `<defaultAttach>()` from Object that
+// simply returns the receiver (see `object_defaultAttach` in
+// wren_core.c).  Classes that declare a `default attachments { ... }`
+// block override it with a Wren-level method that runs
+// `super.<defaultAttach>()` first and then performs one
+// `this.attach(EntryClass.new(...))` per block entry.  Foreign
+// constructors skip this stage — foreign objects do not participate
+// in the attachment machinery and a `<defaultAttach>()` lookup on a
+// foreign receiver would resolve to Object's no-op anyway.
+//
 // This creates that method and calls the initializer with [initializerSymbol].
 static void createConstructor(Compiler* compiler, Signature* signature,
                               int initializerSymbol)
@@ -3712,6 +3724,20 @@ static void createConstructor(Compiler* compiler, Signature* signature,
   // Run its initializer.
   emitShortArg(&methodCompiler, (Code)(CODE_CALL_0 + signature->arity),
                initializerSymbol);
+
+  // REVATE EXTENSION (§7c): stage 4 of `Class.new(...)` — invoke
+  // `<defaultAttach>()` on the freshly-initialised instance.  The
+  // method is contracted to return its receiver, so slot 0 remains
+  // the instance after the call (the no-op default on Object returns
+  // args[0]; user-overridden Wren-level bodies end with
+  // `return this`).  Skipped for foreign classes — foreign receivers
+  // do not carry attachments.
+  if (!compiler->enclosingClass->isForeign)
+  {
+    int defaultAttachSym = methodSymbol(&methodCompiler,
+                                        "<defaultAttach>()", 17);
+    emitShortArg(&methodCompiler, CODE_CALL_0, defaultAttachSym);
+  }
 
   // Return the instance.
   emitOp(&methodCompiler, CODE_RETURN);
@@ -5486,6 +5512,170 @@ static void defaultsBlock(Compiler* compiler)
 }
 // ─────────────────────────────────────────────── end REVATE EXTENSION
 
+// REVATE EXTENSION (§7c) ─────────────────────────────────────────────
+// Parses a `default attachments { ... }` block at the top of a class
+// body and synthesises a `<defaultAttach>()` method on the class.
+//
+// The block is *the* declarative form for "every instance of this
+// class starts life with these attachments installed".  Each entry is
+// either:
+//
+//   - An explicit constructor expression: `EntryClass.new(args...)`.
+//   - A bare class name: `EntryClass` — sugar for `EntryClass.new()`.
+//
+// The synthesised method body, conceptually:
+//
+//   <defaultAttach>() {
+//       super.<defaultAttach>()
+//       this.attach(<entry 1>)
+//       this.attach(<entry 2>)
+//       ...
+//       return this
+//   }
+//
+// The `super` call ensures parent's default attachments run before
+// child's — the §9 `ArmoredGoblin is Goblin` acceptance.  Object
+// carries a no-op `<defaultAttach>()` primitive that returns the
+// receiver, so the super-chain terminates cleanly.
+//
+// `default` and `attachments` are both *context-sensitive*: outside
+// this position they remain usable identifiers (`var default = 5`
+// and `var attachments = 5` are still valid in unrelated code).  The
+// caller must have already consumed the `default` token and verified
+// that the next token is the `attachments` identifier; this function
+// consumes `attachments {` … `}` and emits a complete method binding
+// against `[classVariable]`.
+//
+// The bracketed method name `<defaultAttach>` is unreachable from
+// user Wren code — Wren's lexer refuses to start an identifier with
+// `<` — so the override never collides with anything a user could
+// declare.
+static void defaultAttachmentsBlock(Compiler* compiler,
+                                    Variable classVariable)
+{
+  // Consume `attachments` (caller verified the lookahead).
+  nextToken(compiler->parser);
+  consume(compiler, TOKEN_LEFT_BRACE,
+          "Expect '{' after 'default attachments' in class body.");
+
+  // Resolve / create the method symbol for `<defaultAttach>()` on the
+  // outer compiler's parser so the binding emit below targets it.
+  const char* defaultAttachSig    = "<defaultAttach>()";
+  const int   defaultAttachSigLen = 17;
+  int defaultAttachSymbol = methodSymbol(compiler,
+                                         defaultAttachSig,
+                                         defaultAttachSigLen);
+
+  // Spin up a sub-compiler for the synthesised method body.  Its
+  // bytecode is appended to the outer compiler's class definition
+  // pipeline as a method binding when we call `defineMethod` below.
+  Compiler bodyCompiler;
+  initCompiler(&bodyCompiler, compiler->parser, compiler, true);
+  // Method has arity 0 — only `this` lives in slot 0.
+
+  // ── 1. super.<defaultAttach>() ──
+  //
+  // Emit a super-call against `<defaultAttach>()`.  Wren's CODE_SUPER
+  // family carries a constant slot that `wrenBindMethodCode` patches
+  // to the enclosing class's superclass at method-bind time.  We
+  // emit a NULL placeholder constant here.
+  //
+  // The super-call walks the linear chain: even classes that don't
+  // declare a `default attachments` block themselves inherit Object's
+  // no-op primitive at this symbol, so the chain terminates.
+  emitOp(&bodyCompiler, CODE_LOAD_LOCAL_0);  // push `this` as receiver
+  emitShortArg(&bodyCompiler, CODE_SUPER_0, defaultAttachSymbol);
+  emitShort(&bodyCompiler, addConstant(&bodyCompiler, NULL_VAL));
+  emitOp(&bodyCompiler, CODE_POP);            // discard super's return
+
+  // ── 2. attach calls for each entry ──
+  //
+  // Resolve the symbol for `attach(_)` (the §7b primitive on Object)
+  // up front so each iteration can emit CODE_CALL_1 against the same
+  // symbol.
+  int attachSymbol = methodSymbol(&bodyCompiler, "attach(_)", 9);
+
+  ignoreNewlines(&bodyCompiler);
+  while (peek(&bodyCompiler) != TOKEN_RIGHT_BRACE &&
+         peek(&bodyCompiler) != TOKEN_EOF)
+  {
+    // Each entry compiles into:
+    //   LOAD_LOCAL_0          ; receiver = this
+    //   <entry expression>    ; pushes the attachment instance
+    //   CALL_1 attach(_)      ; pops 2, pushes return
+    //   POP                   ; discard
+    emitOp(&bodyCompiler, CODE_LOAD_LOCAL_0);
+
+    // Detect the bare-name sugar: a TOKEN_NAME followed by anything
+    // OTHER than `.` or `(`.  In that case, emit `EntryClass.new()`.
+    // Otherwise, parse a normal expression (handles
+    // `EntryClass.new(args...)` and any other expression that
+    // produces an attachment instance).
+    if (peek(&bodyCompiler) == TOKEN_NAME &&
+        peekNext(&bodyCompiler) != TOKEN_DOT &&
+        peekNext(&bodyCompiler) != TOKEN_LEFT_PAREN)
+    {
+      // Bare-name form: consume the identifier, load it as a
+      // variable, then emit `new()` against the zero-arg constructor
+      // symbol on the class.  The symbol "new()" is the static
+      // constructor entry point that `createConstructor` binds.
+      nextToken(bodyCompiler.parser);
+      Variable nameVar = resolveName(&bodyCompiler,
+          bodyCompiler.parser->previous.start,
+          bodyCompiler.parser->previous.length);
+      if (nameVar.index == -1)
+      {
+        error(&bodyCompiler,
+              "Unknown class '%.*s' in 'default attachments' block.",
+              bodyCompiler.parser->previous.length,
+              bodyCompiler.parser->previous.start);
+      }
+      else
+      {
+        loadVariable(&bodyCompiler, nameVar);
+      }
+      int newSymbol = methodSymbol(&bodyCompiler, "new()", 5);
+      emitShortArg(&bodyCompiler, CODE_CALL_0, newSymbol);
+    }
+    else
+    {
+      // Full expression form — typically `EntryClass.new(args...)`,
+      // but any expression whose value is an attachment instance is
+      // accepted.  Mis-typed values surface as the same runtime guard
+      // §7b emits for an explicit `host.attach(NotAnAttachment)`.
+      expression(&bodyCompiler);
+    }
+
+    // this.attach(att) — receiver and arg are on the stack.
+    emitShortArg(&bodyCompiler, CODE_CALL_1, attachSymbol);
+    emitOp(&bodyCompiler, CODE_POP);
+
+    // Separator: tolerate either a newline or a comma between entries.
+    if (!match(&bodyCompiler, TOKEN_LINE))
+    {
+      match(&bodyCompiler, TOKEN_COMMA);
+    }
+    ignoreNewlines(&bodyCompiler);
+  }
+
+  consume(&bodyCompiler, TOKEN_RIGHT_BRACE,
+          "Expect '}' to close 'default attachments' block.");
+
+  // ── 3. return this ──
+  emitOp(&bodyCompiler, CODE_LOAD_LOCAL_0);
+  emitOp(&bodyCompiler, CODE_RETURN);
+
+  endCompiler(&bodyCompiler, defaultAttachSig, defaultAttachSigLen);
+
+  // Bind the synthesised method against the class.  Public so the
+  // constructor allocator's `CODE_CALL_0 <defaultAttach>()` resolves
+  // through the normal dispatch path; bracketed name makes it
+  // unreachable from user Wren.
+  defineMethod(compiler, classVariable, /*isStatic*/ false,
+               /*isPublic*/ true, defaultAttachSymbol);
+}
+// ─────────────────────────────────────────────── end REVATE EXTENSION
+
 // Compiles a class definition. Assumes the "class" token has already been
 // consumed (along with a possibly preceding "foreign" token).
 static void classDefinition(Compiler* compiler, bool isForeign)
@@ -5622,57 +5812,156 @@ static void classDefinition(Compiler* compiler, bool isForeign)
   consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' after class declaration.");
   matchLine(compiler);
 
-  // REVATE EXTENSION (§6c): optional `defaults { ... }` block at the
-  // top of the class body.  `defaults` is a context-sensitive keyword
-  // — only recognized here, never reserved at module scope.  At most
-  // one block per class.
+  // REVATE EXTENSION (§6c / §7c): optional top-of-class blocks.  Both
+  // `defaults { … }` (§6c) and `default attachments { … }` (§7c) live
+  // here — they are context-sensitive (neither `defaults`, `default`,
+  // nor `attachments` is a reserved keyword), at-most-one per class,
+  // and may appear in either order.
   //
-  // The block runs at class-definition time, AFTER all CODE_BIND_MIXIN
-  // (so the mixin's own defaults have been merged into the host's
-  // template) and BEFORE CODE_VALIDATE_OVERRIDES (so the class state
-  // is fully wired when validation runs).
-  bool sawDefaults = false;
-  while (peek(compiler) == TOKEN_NAME &&
-         compiler->parser->current.length == 8 &&
-         memcmp(compiler->parser->current.start, "defaults", 8) == 0 &&
-         peekNext(compiler) == TOKEN_LEFT_BRACE)
+  // `defaults { }` runs at class-definition time, AFTER all
+  // CODE_BIND_MIXIN (so the mixin's own defaults have been merged
+  // into the host's template) and BEFORE CODE_VALIDATE_OVERRIDES.
+  //
+  // `default attachments { }` produces a synthesised
+  // `<defaultAttach>()` method on the class; the method is dispatched
+  // at the tail of every `Class.new(...)` allocator emitted by
+  // `createConstructor`.
+  bool sawDefaults          = false;
+  bool sawDefaultAttachments = false;
+  while (peek(compiler) == TOKEN_NAME)
   {
-    if (sawDefaults)
+    // §6c: `defaults {` — the legacy mixin-field-defaults block.
+    bool isDefaults =
+        compiler->parser->current.length == 8 &&
+        memcmp(compiler->parser->current.start, "defaults", 8) == 0 &&
+        peekNext(compiler) == TOKEN_LEFT_BRACE;
+
+    // §7c: `default attachments {` — the declarative default-
+    // attachment list.  Note that the first identifier here is
+    // `default` (length 7), which is distinct from §6c's `defaults`
+    // (length 8) — the two never alias.
+    bool isDefaultLead =
+        compiler->parser->current.length == 7 &&
+        memcmp(compiler->parser->current.start, "default", 7) == 0;
+    bool isDefaultAttachments = false;
+    if (isDefaultLead && peekNext(compiler) == TOKEN_NAME)
+    {
+      // Confirm the next token is the literal identifier
+      // `attachments`.  Anything else falls back to a compile error
+      // issued below so an unrelated identifier starting with
+      // `default` can't accidentally trigger the block parser.
+      isDefaultAttachments =
+          compiler->parser->next.length == 11 &&
+          memcmp(compiler->parser->next.start, "attachments", 11) == 0;
+    }
+
+    // Reject `default {` (no `attachments`) at the top of a class
+    // body.  Without this, vanilla Wren's getter-signature parser
+    // would happily accept it as a no-arg getter method named
+    // `default`, which would silently miss the user's typo.
+    if (isDefaultLead && !isDefaultAttachments &&
+        peekNext(compiler) == TOKEN_LEFT_BRACE)
     {
       error(compiler,
-            "A class may have at most one 'defaults' block.");
-      // Consume the identifier so the loop can attempt to parse and
-      // surface inner errors too, then break out.
-    }
-    sawDefaults = true;
-
-    // Consume the 'defaults' identifier.
-    nextToken(compiler->parser);
-
-    // Load the class so MIXIN_FIELD_DEFAULT can PEEK it.
-    if (!isForeign)
-    {
-      loadVariable(compiler, classVariable);
-      defaultsBlock(compiler);
-      emitOp(compiler, CODE_POP);
-    }
-    else
-    {
-      // Foreign classes can't carry instance fields, so a defaults
-      // block makes no sense.  Surface a clean error and skip past
-      // the block.
-      error(compiler,
-            "Foreign classes cannot have a 'defaults' block.");
-      // Best-effort skip: consume until the matching '}'.
-      int depth = 0;
-      while (peek(compiler) != TOKEN_EOF)
+            "Expect 'attachments' after 'default' in class body "
+            "(did you mean 'default attachments { … }'?).");
+      // Consume `default` and the immediately-following block so the
+      // class parser can recover and surface inner errors cleanly.
+      nextToken(compiler->parser);
+      if (match(compiler, TOKEN_LEFT_BRACE))
       {
-        if (match(compiler, TOKEN_LEFT_BRACE))  { depth++; continue; }
-        if (peek(compiler) == TOKEN_RIGHT_BRACE)
+        int depth = 1;
+        while (depth > 0 && peek(compiler) != TOKEN_EOF)
         {
-          if (--depth <= 0) { nextToken(compiler->parser); break; }
+          if (match(compiler, TOKEN_LEFT_BRACE))  { depth++; continue; }
+          if (peek(compiler) == TOKEN_RIGHT_BRACE)
+          {
+            if (--depth <= 0) { nextToken(compiler->parser); break; }
+          }
+          nextToken(compiler->parser);
         }
-        nextToken(compiler->parser);
+      }
+      matchLine(compiler);
+      continue;
+    }
+
+    if (!isDefaults && !isDefaultAttachments) break;
+
+    if (isDefaults)
+    {
+      if (sawDefaults)
+      {
+        error(compiler,
+              "A class may have at most one 'defaults' block.");
+      }
+      sawDefaults = true;
+
+      // Consume the 'defaults' identifier.
+      nextToken(compiler->parser);
+
+      if (!isForeign)
+      {
+        // Load the class so MIXIN_FIELD_DEFAULT can PEEK it.
+        loadVariable(compiler, classVariable);
+        defaultsBlock(compiler);
+        emitOp(compiler, CODE_POP);
+      }
+      else
+      {
+        // Foreign classes can't carry instance fields, so a defaults
+        // block makes no sense.  Surface a clean error and skip past
+        // the block.
+        error(compiler,
+              "Foreign classes cannot have a 'defaults' block.");
+        // Best-effort skip: consume until the matching '}'.
+        int depth = 0;
+        while (peek(compiler) != TOKEN_EOF)
+        {
+          if (match(compiler, TOKEN_LEFT_BRACE))  { depth++; continue; }
+          if (peek(compiler) == TOKEN_RIGHT_BRACE)
+          {
+            if (--depth <= 0) { nextToken(compiler->parser); break; }
+          }
+          nextToken(compiler->parser);
+        }
+      }
+    }
+    else // isDefaultAttachments
+    {
+      if (sawDefaultAttachments)
+      {
+        error(compiler,
+              "A class may have at most one 'default attachments' block.");
+      }
+      sawDefaultAttachments = true;
+
+      // Consume the 'default' identifier — the helper consumes
+      // `attachments {` … `}` and emits the method binding.
+      nextToken(compiler->parser);
+
+      if (!isForeign)
+      {
+        defaultAttachmentsBlock(compiler, classVariable);
+      }
+      else
+      {
+        // Foreign classes do not participate in the attachment
+        // machinery — `<defaultAttach>()` is never invoked on a
+        // foreign receiver — so the block makes no sense.
+        error(compiler,
+              "Foreign classes cannot have a 'default attachments' block.");
+        // Best-effort skip: also consume `attachments` and the body.
+        if (peek(compiler) == TOKEN_NAME) nextToken(compiler->parser);
+        int depth = 0;
+        while (peek(compiler) != TOKEN_EOF)
+        {
+          if (match(compiler, TOKEN_LEFT_BRACE))  { depth++; continue; }
+          if (peek(compiler) == TOKEN_RIGHT_BRACE)
+          {
+            if (--depth <= 0) { nextToken(compiler->parser); break; }
+          }
+          nextToken(compiler->parser);
+        }
       }
     }
 
