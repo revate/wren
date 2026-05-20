@@ -117,6 +117,8 @@ typedef enum
   TOKEN_AT,
   TOKEN_SINGLETON,
   TOKEN_RAW,
+  // REVATE EXTENSION (§6b): `my.MixinName.foo(...)` mixin-namespace access.
+  TOKEN_MY,
 
   TOKEN_FIELD,
   TOKEN_STATIC_FIELD,
@@ -213,6 +215,14 @@ typedef struct
 
   // If a syntax or compile error has occurred.
   bool hasError;
+
+  // REVATE EXTENSION (§6a): module-level @no_override_warnings pragma.
+  // When set, every class that follows in the same module skips the
+  // "unannotated shadow" warning.  Explicit @override(X) errors (e.g.
+  // X not in `with`-list or X doesn't declare the method) are still
+  // surfaced — the pragma silences shadow warnings only, not real
+  // mistakes.
+  bool noOverrideWarnings;
 } Parser;
 
 typedef struct
@@ -325,6 +335,12 @@ typedef struct
   // class whose body only declared `static` members.
   bool isSingleton;
 
+  // REVATE EXTENSION (§6b): True if the body being compiled is a
+  // `mixin` definition rather than a `class`.  `my.X.y` syntax is
+  // rejected inside mixin bodies (mixins talk about themselves with
+  // plain identifiers).
+  bool isMixin;
+
   // True if the current method being compiled is static.
   bool inStatic;
 
@@ -337,6 +353,59 @@ typedef struct
   int fieldDefaultSlot[MAX_FIELDS];
   Value fieldDefaultValue[MAX_FIELDS];
   int numFieldDefaults;
+
+  // REVATE EXTENSION: §6a — @override(MixinName) annotation tracking.
+  //
+  // withMixinNames[i] is the source token for the i-th mixin in the
+  // `with` clause.  We keep the raw substring (not an interned string)
+  // because at this point during parsing the mixin name is just a token
+  // we matched; we'll intern it into the constant pool when emitting
+  // the validation payload.
+  //
+  // Up to MAX_WITH_MIXINS entries (mirrors the local constant in
+  // classDefinition).
+  const char* withMixinNames[16];   // == MAX_WITH_MIXINS
+  int         withMixinNameLens[16];
+  int         numWithMixins;
+
+  // Pending overrides for the *next* method to be declared in this
+  // class body.  Consumed by declareMethod when it records the symbol.
+  // `@override(A)` followed by `@override(B)` before `public foo() {}`
+  // stacks both targets in `pendingOverrides`.
+  const char* pendingOverrideNames[16];
+  int         pendingOverrideNameLens[16];
+  int         numPendingOverrides;
+
+  // For each method the class declared directly (i.e. body of this
+  // class, not inherited / not pulled in from a mixin), we record:
+  //   - the full signature string (signed copy into a static buffer)
+  //   - the list of mixin names from any @override(...) annotations,
+  //     stored as raw (start, length) pointers into the parser's source
+  //     buffer (which lives for the entire compile)
+  //   - whether it is a static method
+  //
+  // The runtime validator uses this to detect shadows (signature exists
+  // both in class and in some mixin) and to verify each @override(X)
+  // points at a mixin that (a) appears in `with` and (b) actually
+  // declares the method.
+  //
+  // Sized for the typical class body in this codebase; the test suite
+  // never approaches these caps.
+  #define WREN_MAX_OVERRIDE_METHODS 64
+  #define WREN_MAX_OVERRIDES_PER_METHOD 8
+  // Signature for the i-th tracked method.  Stored as a fixed-size
+  // buffer so we don't have to manage a separate allocation; signatures
+  // are bounded by MAX_METHOD_SIGNATURE elsewhere in the compiler.
+  char        overrideMethodSigBuf[WREN_MAX_OVERRIDE_METHODS]
+                                  [MAX_METHOD_SIGNATURE + 8 + 7]; // matches copyMethodAttributes
+  int         overrideMethodSigLen[WREN_MAX_OVERRIDE_METHODS];
+  bool        overrideMethodIsStatic[WREN_MAX_OVERRIDE_METHODS];
+  const char* overrideMethodTargets[WREN_MAX_OVERRIDE_METHODS]
+                                   [WREN_MAX_OVERRIDES_PER_METHOD];
+  int         overrideMethodTargetLens[WREN_MAX_OVERRIDE_METHODS]
+                                      [WREN_MAX_OVERRIDES_PER_METHOD];
+  int         numOverrideTargets[WREN_MAX_OVERRIDE_METHODS];
+  int         numOverrideMethods;
 } ClassInfo;
 
 struct sCompiler
@@ -662,6 +731,7 @@ static Keyword keywords[] =
   {"enum",      4, TOKEN_ENUM},
   {"singleton", 9, TOKEN_SINGLETON},
   {"raw",       3, TOKEN_RAW},
+  {"my",        2, TOKEN_MY},
   {NULL,        0, TOKEN_EOF} // Sentinel to mark the end of the array.
 };
 
@@ -1819,6 +1889,29 @@ static bool finishBlock(Compiler* compiler)
   // If there's no line after the "{", it's a single-expression body.
   if (!matchLine(compiler))
   {
+    // REVATE EXTENSION: allow `{ return <expr> }` as a single-line
+    // method body.  Vanilla Wren treats the brace content as an
+    // expression here, but `return` is a statement and produces a
+    // confusing "Expected expression." diagnostic.  Parse it as a
+    // statement so the natural form works:
+    //
+    //   class Foo {
+    //       bar() { return 42 }
+    //   }
+    //
+    // The statement form leaves nothing on the stack, so we report
+    // this as a non-expression body (finishBody won't emit an extra
+    // implicit-return).
+    if (peek(compiler) == TOKEN_RETURN)
+    {
+      statement(compiler);
+      // Consume optional trailing newlines inside the braces so
+      // `{ return foo }` and `{ return foo\n}` both close cleanly.
+      ignoreNewlines(compiler);
+      consume(compiler, TOKEN_RIGHT_BRACE, "Expect '}' at end of block.");
+      return false;
+    }
+
     expression(compiler);
     consume(compiler, TOKEN_RIGHT_BRACE, "Expect '}' at end of block.");
     return true;
@@ -2667,6 +2760,140 @@ static void this_(Compiler* compiler, bool canAssign)
   loadThis(compiler);
 }
 
+// REVATE EXTENSION (§6b) ───────────────────────────────────────────────────
+// `my.MixinName.method(args)` and `my.MixinName.field` — explicit mixin
+// dispatch.  See docs/specs/wren_language_extensions.md §6b.
+//
+// Syntax: my . NAME . NAME [ ( args ) | = expr ]
+//   - The first NAME must be the name of a mixin in the enclosing
+//     class's `with` list (validated against
+//     compiler->enclosingClass->withMixinNames[]).
+//   - The second NAME is the method or field name on that mixin.
+//   - `( args )` makes it a method call (emits CODE_INVOKE_MIXIN_METHOD_<n>).
+//   - `= expr` makes it a field store (emits CODE_STORE_MIXIN_FIELD_THIS).
+//   - Otherwise it is a field load (emits CODE_LOAD_MIXIN_FIELD_THIS).
+//
+// All errors are surfaced through error() at the parser level.  The
+// "does the mixin actually declare this method/field?" check is
+// deferred to runtime because the compiler does not have access to
+// the mixin's method/field tables (mixins are ObjClasses populated
+// during the bytecode run, not at parse time).
+static void my_(Compiler* compiler, bool canAssign)
+{
+  // ── Validate context: we must be inside an instance method body. ──
+  ClassInfo* enclosingClass = getEnclosingClass(compiler);
+  if (enclosingClass == NULL)
+  {
+    error(compiler, "Cannot use 'my' outside of a class method.");
+  }
+  else if (enclosingClass->isMixin)
+  {
+    error(compiler, "Cannot use 'my' inside a mixin body — "
+                    "'my' is for cross-namespace access from a host class.");
+  }
+  else if (enclosingClass->inStatic)
+  {
+    error(compiler, "Cannot use 'my' in a static method (no receiver).");
+  }
+  // The parser keeps going past these errors so we still get a clean
+  // structural parse of the rest of the file.
+
+  // ── Mixin name. ──
+  consume(compiler, TOKEN_DOT, "Expect '.' after 'my'.");
+  consume(compiler, TOKEN_NAME, "Expect mixin name after 'my.'.");
+  const char* mixinName = compiler->parser->previous.start;
+  int mixinNameLen      = compiler->parser->previous.length;
+
+  // Validate mixinName is in the enclosing class's `with` list.
+  int withSlot = -1;
+  if (enclosingClass != NULL)
+  {
+    for (int i = 0; i < enclosingClass->numWithMixins; i++)
+    {
+      if (enclosingClass->withMixinNameLens[i] == mixinNameLen &&
+          memcmp(enclosingClass->withMixinNames[i], mixinName,
+                 (size_t)mixinNameLen) == 0)
+      {
+        withSlot = i;
+        break;
+      }
+    }
+    if (withSlot < 0)
+    {
+      error(compiler,
+            "'%.*s' is not in the `with` list for class '%s'.",
+            mixinNameLen, mixinName,
+            enclosingClass->name != NULL
+                ? enclosingClass->name->value : "<unknown>");
+    }
+  }
+
+  // ── Method / field name. ──
+  consume(compiler, TOKEN_DOT, "Expect '.' after mixin name in 'my.X' access.");
+  consume(compiler, TOKEN_NAME,
+          "Expect method or field name after 'my.MixinName.'.");
+  const char* memberName = compiler->parser->previous.start;
+  int memberNameLen      = compiler->parser->previous.length;
+
+  // Constant for the mixin name string — used at runtime by every
+  // INVOKE_MIXIN_METHOD / LOAD_MIXIN_FIELD_THIS / STORE_MIXIN_FIELD_THIS
+  // emission.
+  int mixinNameConst = addConstant(compiler,
+      wrenNewStringLength(compiler->parser->vm, mixinName,
+                          (size_t)mixinNameLen));
+
+  if (match(compiler, TOKEN_LEFT_PAREN))
+  {
+    // ── Method call form: my.MixinName.method(args) ──
+    // Load receiver (this) as the first argument.
+    loadThis(compiler);
+
+    // Build the signature.  Parse arg list, then build the
+    // "method(_,_,...)" signature string.
+    Signature signature = { memberName, memberNameLen, SIG_GETTER, 0 };
+    signature.type  = SIG_METHOD;
+
+    ignoreNewlines(compiler);
+    if (peek(compiler) != TOKEN_RIGHT_PAREN)
+    {
+      finishArgumentList(compiler, &signature);
+    }
+    consume(compiler, TOKEN_RIGHT_PAREN, "Expect ')' after arguments.");
+
+    int symbol = signatureSymbol(compiler, &signature);
+
+    // Stack effect of CODE_INVOKE_MIXIN_METHOD_<n>: -n (mirrors CALL_<n>).
+    Code inst = (Code)(CODE_INVOKE_MIXIN_METHOD_0 + signature.arity);
+    emitShortArg(compiler, inst, mixinNameConst);
+    emitShort(compiler, symbol);
+
+    allowLineBeforeDot(compiler);
+    return;
+  }
+
+  // ── Field access form: my.MixinName.field [= value] ──
+  // Constant for the field name string.
+  int fieldNameConst = addConstant(compiler,
+      wrenNewStringLength(compiler->parser->vm, memberName,
+                          (size_t)memberNameLen));
+
+  if (canAssign && match(compiler, TOKEN_EQ))
+  {
+    // Store: compile RHS, then STORE_MIXIN_FIELD_THIS.
+    expression(compiler);
+    emitShortArg(compiler, CODE_STORE_MIXIN_FIELD_THIS, mixinNameConst);
+    emitShort(compiler, fieldNameConst);
+  }
+  else
+  {
+    // Load: LOAD_MIXIN_FIELD_THIS.
+    emitShortArg(compiler, CODE_LOAD_MIXIN_FIELD_THIS, mixinNameConst);
+    emitShort(compiler, fieldNameConst);
+  }
+
+  allowLineBeforeDot(compiler);
+}
+
 // Subscript or "array indexing" operator like `foo[bar]`.
 static void subscript(Compiler* compiler, bool canAssign)
 {
@@ -2975,6 +3202,7 @@ GrammarRule rules[] =
   /* TOKEN_AT            */ UNUSED,
   /* TOKEN_SINGLETON     */ UNUSED,
   /* TOKEN_RAW           */ PREFIX(rawAccess),
+  /* TOKEN_MY            */ PREFIX(my_),
   /* TOKEN_FIELD         */ PREFIX(field),
   /* TOKEN_STATIC_FIELD  */ PREFIX(staticField),
   /* TOKEN_NAME          */ { name, NULL, namedSignature, PREC_NONE, NULL },
@@ -3059,6 +3287,7 @@ static int getByteCountForArguments(const uint8_t* bytecode,
     case CODE_END_MODULE:
     case CODE_END_CLASS:
     case CODE_BIND_MIXIN:
+    case CODE_VALIDATE_OVERRIDES:
       return 0;
 
     case CODE_LOAD_LOCAL:
@@ -3495,6 +3724,22 @@ static void defineMethod(Compiler* compiler, Variable classVariable,
   emitShortArg(compiler, instruction, methodSymbol);
 }
 
+// REVATE EXTENSION (§6a) — forward declaration for the helper that
+// snapshots a method's @override(...) annotations into the ClassInfo's
+// fixed-size tracking buffers, where the validation-payload emitter
+// reads them later.
+static void recordOverrideTargets(Compiler* compiler, const char* name,
+                                  int length, bool isStatic, bool isForeign);
+
+// REVATE EXTENSION (§6a) — forward declaration for the helper that
+// emits CODE_VALIDATE_OVERRIDES + its associated payload at the end of
+// a class definition.  Defined further down, near the rest of the
+// attribute emission code, so it can share the same emitAttributes /
+// callMethod helpers.
+static void emitOverrideValidationPayload(Compiler* compiler,
+                                          ClassInfo* classInfo,
+                                          Variable classVariable);
+
 // Declares a method in the enclosing class with [signature].
 //
 // Reports an error if a method with that signature is already declared.
@@ -3503,7 +3748,7 @@ static int declareMethod(Compiler* compiler, Signature* signature,
                          const char* name, int length)
 {
   int symbol = signatureSymbol(compiler, signature);
-  
+
   // See if the class has already declared method with this signature.
   ClassInfo* classInfo = compiler->enclosingClass;
   IntBuffer* methods = classInfo->inStatic
@@ -3518,7 +3763,7 @@ static int declareMethod(Compiler* compiler, Signature* signature,
       break;
     }
   }
-  
+
   wrenIntBufferWrite(compiler->parser->vm, methods, symbol);
   return symbol;
 }
@@ -3546,15 +3791,38 @@ static bool matchAttribute(Compiler* compiler) {
   {
     compiler->numAttributes++;
     bool runtimeAccess = isAt || match(compiler, TOKEN_BANG);
-    if(match(compiler, TOKEN_NAME)) 
+    if(match(compiler, TOKEN_NAME))
     {
       Value group = compiler->parser->previous.value;
+      // REVATE EXTENSION (§6a): module-level @no_override_warnings
+      // pragma.  Recognised only outside of any class body; when
+      // present, set a parser-level flag so subsequent classes opt
+      // out of shadow warnings.  We swallow it (no entry pushed into
+      // compiler->attributes) so it doesn't surface as a runtime
+      // attribute on whatever definition follows.
+      const char kPragma[] = "no_override_warnings";
+      const int  kPragmaLen = (int)(sizeof(kPragma) - 1);
+      bool isNoOverrideWarnings =
+          isAt &&
+          IS_STRING(group) &&
+          AS_STRING(group)->length == kPragmaLen &&
+          memcmp(AS_STRING(group)->value, kPragma, kPragmaLen) == 0;
+      if (isNoOverrideWarnings && compiler->enclosingClass == NULL)
+      {
+        compiler->parser->noOverrideWarnings = true;
+        // Don't count this pragma against numAttributes — it doesn't
+        // describe the following definition, it describes the file.
+        compiler->numAttributes--;
+        consumeLine(compiler,
+                    "Expect newline after @no_override_warnings.");
+        return true;
+      }
       TokenType ahead = peek(compiler);
       if(ahead == TOKEN_EQ || ahead == TOKEN_LINE)
       {
         Value key = group;
         Value value = NULL_VAL;
-        if(match(compiler, TOKEN_EQ)) 
+        if(match(compiler, TOKEN_EQ))
         {
           value = consumeLiteral(compiler, "Expect a Bool, Num, String or Identifier literal for an attribute value.");
         }
@@ -3701,8 +3969,15 @@ static bool method(Compiler* compiler, Variable classVariable)
   int length;
   signatureToString(&signature, fullSignature, &length);
 
-  // Copy any attributes the compiler collected into the enclosing class 
+  // Copy any attributes the compiler collected into the enclosing class
   copyMethodAttributes(compiler, isForeign, isStatic, fullSignature, length);
+
+  // REVATE EXTENSION (§6a): snapshot any @override(...) annotations from
+  // the just-collected method attributes into the override-validation
+  // tracking buffer on the enclosing class.  Must happen AFTER
+  // copyMethodAttributes (which populates methodAttributes[fullSigWithPrefix])
+  // and BEFORE the next method's attributes are parsed.
+  recordOverrideTargets(compiler, fullSignature, length, isStatic, isForeign);
 
   // Check for duplicate methods. Doesn't matter that it's already been
   // defined, error will discard bytecode anyway.
@@ -4341,6 +4616,7 @@ static void enumDefinition(Compiler* compiler)
   ClassInfo classInfo;
   classInfo.isForeign = false;
   classInfo.isSingleton = false;
+  classInfo.isMixin = false; // §6b
   classInfo.name = className;
   classInfo.classAttributes = NULL;
   classInfo.methodAttributes = NULL;
@@ -4449,10 +4725,11 @@ static void mixinDefinition(Compiler* compiler)
   ClassInfo classInfo;
   classInfo.isForeign = false;
   classInfo.isSingleton = false;
+  classInfo.isMixin = true; // §6b: this is a `mixin Name { ... }` body
   classInfo.name = className;
 
   classInfo.classAttributes = compiler->attributes->count > 0
-        ? wrenNewMap(compiler->parser->vm) 
+        ? wrenNewMap(compiler->parser->vm)
         : NULL;
   classInfo.methodAttributes = NULL;
   copyAttributes(compiler, classInfo.classAttributes);
@@ -4461,6 +4738,13 @@ static void mixinDefinition(Compiler* compiler)
   wrenIntBufferInit(&classInfo.methods);
   wrenIntBufferInit(&classInfo.staticMethods);
   classInfo.numFieldDefaults = 0;
+  // REVATE EXTENSION (§6a): mixins themselves do not participate in
+  // override validation (they're the source of methods being overridden,
+  // not the targets).  Initialise the tracking buffers to empty so the
+  // generic GC / lifetime paths see a consistent state.
+  classInfo.numWithMixins      = 0;
+  classInfo.numPendingOverrides = 0;
+  classInfo.numOverrideMethods  = 0;
   compiler->enclosingClass = &classInfo;
 
   // Compile the method definitions.
@@ -4553,6 +4837,7 @@ static void singletonDefinition(Compiler* compiler)
   ClassInfo classInfo;
   classInfo.isForeign      = false;
   classInfo.isSingleton    = true;
+  classInfo.isMixin        = false; // §6b
   classInfo.name           = className;
   classInfo.classAttributes  = compiler->attributes->count > 0
                                  ? wrenNewMap(compiler->parser->vm)
@@ -4563,6 +4848,11 @@ static void singletonDefinition(Compiler* compiler)
   wrenIntBufferInit(&classInfo.methods);
   wrenIntBufferInit(&classInfo.staticMethods);
   classInfo.numFieldDefaults = 0;
+  // REVATE EXTENSION (§6a): singletons can't `with` anything, so the
+  // override tracking buffers stay empty.
+  classInfo.numWithMixins       = 0;
+  classInfo.numPendingOverrides = 0;
+  classInfo.numOverrideMethods  = 0;
 
   compiler->enclosingClass = &classInfo;
 
@@ -4594,6 +4884,129 @@ static void singletonDefinition(Compiler* compiler)
   popScope(compiler);
 }
 // ─────────────────────────────────────────────────────── end REVATE EXTENSION
+
+// REVATE EXTENSION (§6c) ─────────────────────────────────────────────
+// Parses a `defaults { ... }` block at the top of a class body.
+// Emits, for each `MixinName.fieldName = literal` line inside the
+// block:
+//
+//   ... class is already on the stack (caller's responsibility) ...
+//   CODE_CONSTANT <literal>           // pushes the literal
+//   CODE_MIXIN_FIELD_DEFAULT          // pops the literal
+//       <mixinNameConst:short>        // leaves the class on the stack
+//       <fieldNameConst:short>
+//
+// Compile-time validation:
+//   - MixinName must appear in the enclosing class's `with` list.
+//   - The RHS must be a literal (Num, String, Bool, null) — same
+//     restriction as `var name = literal` (see classField).
+//   - Only assignments are allowed; no method calls, no control
+//     flow, no `this`, no nested expressions.
+//
+// Errors stay narrow (`error(...)` calls — WREN_ERROR_COMPILE).  The
+// "field does not exist on the mixin" check is deferred to runtime,
+// mirroring §6b's late-bound model.
+//
+// The caller must have already loaded the class variable so the
+// class is on top of the stack on entry, and must POP it after the
+// block returns.
+static void defaultsBlock(Compiler* compiler)
+{
+  ClassInfo* enclosingClass = compiler->enclosingClass;
+
+  consume(compiler, TOKEN_LEFT_BRACE,
+          "Expect '{' after 'defaults' in class body.");
+  ignoreNewlines(compiler);
+
+  while (peek(compiler) != TOKEN_RIGHT_BRACE &&
+         peek(compiler) != TOKEN_EOF)
+  {
+    // ── MixinName ──
+    consume(compiler, TOKEN_NAME,
+            "Expect mixin name in 'defaults' block.");
+    const char* mixinName = compiler->parser->previous.start;
+    int mixinNameLen      = compiler->parser->previous.length;
+
+    // Validate mixinName is in the enclosing class's `with` list.
+    if (enclosingClass != NULL)
+    {
+      bool found = false;
+      for (int i = 0; i < enclosingClass->numWithMixins; i++)
+      {
+        if (enclosingClass->withMixinNameLens[i] == mixinNameLen &&
+            memcmp(enclosingClass->withMixinNames[i], mixinName,
+                   (size_t)mixinNameLen) == 0)
+        {
+          found = true;
+          break;
+        }
+      }
+      if (!found)
+      {
+        error(compiler,
+              "'%.*s' is not in the `with` list for class '%s'.",
+              mixinNameLen, mixinName,
+              enclosingClass->name != NULL
+                  ? enclosingClass->name->value : "<unknown>");
+      }
+    }
+
+    // ── . fieldName ──
+    consume(compiler, TOKEN_DOT,
+            "Expect '.' after mixin name in 'defaults' block.");
+    consume(compiler, TOKEN_NAME,
+            "Expect field name after mixin name in 'defaults' block.");
+    const char* fieldName = compiler->parser->previous.start;
+    int fieldNameLen      = compiler->parser->previous.length;
+
+    // ── = literal ──
+    consume(compiler, TOKEN_EQ,
+            "Expect '=' in 'defaults' block (only "
+            "'MixinName.field = literal' assignments are allowed).");
+
+    Value defaultVal = NULL_VAL;
+    if      (match(compiler, TOKEN_FALSE))  defaultVal = FALSE_VAL;
+    else if (match(compiler, TOKEN_TRUE))   defaultVal = TRUE_VAL;
+    else if (match(compiler, TOKEN_NULL))   { /* already NULL_VAL */ }
+    else if (match(compiler, TOKEN_NUMBER)) defaultVal = compiler->parser->previous.value;
+    else if (match(compiler, TOKEN_STRING)) defaultVal = compiler->parser->previous.value;
+    else
+    {
+      error(compiler,
+            "Default value in 'defaults' block must be a literal "
+            "(Num, String, Bool, or null).");
+      // Consume one token to avoid cascading errors.
+      nextToken(compiler->parser);
+    }
+
+    // Build constants for mixin name and field name.
+    int mixinNameConst = addConstant(compiler,
+        wrenNewStringLength(compiler->parser->vm, mixinName,
+                            (size_t)mixinNameLen));
+    int fieldNameConst = addConstant(compiler,
+        wrenNewStringLength(compiler->parser->vm, fieldName,
+                            (size_t)fieldNameLen));
+
+    // Emit: push literal, then MIXIN_FIELD_DEFAULT (pops the literal,
+    // leaves the class on the stack).
+    emitConstant(compiler, defaultVal);
+    emitShortArg(compiler, CODE_MIXIN_FIELD_DEFAULT, mixinNameConst);
+    emitShort(compiler, fieldNameConst);
+
+    // Allow newline or comma between entries (we accept either; the
+    // canonical form is one assignment per line).
+    if (!match(compiler, TOKEN_LINE))
+    {
+      // Either a comma (tolerated) or we're at the closing brace.
+      match(compiler, TOKEN_COMMA);
+    }
+    ignoreNewlines(compiler);
+  }
+
+  consume(compiler, TOKEN_RIGHT_BRACE,
+          "Expect '}' to close 'defaults' block.");
+}
+// ─────────────────────────────────────────────── end REVATE EXTENSION
 
 // Compiles a class definition. Assumes the "class" token has already been
 // consumed (along with a possibly preceding "foreign" token).
@@ -4690,12 +5103,13 @@ static void classDefinition(Compiler* compiler, bool isForeign)
   ClassInfo classInfo;
   classInfo.isForeign = isForeign;
   classInfo.isSingleton = false;
+  classInfo.isMixin = false; // §6b
   classInfo.name = className;
 
-  // Allocate attribute maps if necessary. 
+  // Allocate attribute maps if necessary.
   // A method will allocate the methods one if needed
-  classInfo.classAttributes = compiler->attributes->count > 0 
-        ? wrenNewMap(compiler->parser->vm) 
+  classInfo.classAttributes = compiler->attributes->count > 0
+        ? wrenNewMap(compiler->parser->vm)
         : NULL;
   classInfo.methodAttributes = NULL;
   // Copy any existing attributes into the class
@@ -4706,17 +5120,85 @@ static void classDefinition(Compiler* compiler, bool isForeign)
   // bytecode will be adjusted by [wrenBindMethod] to take inherited fields
   // into account.
   wrenSymbolTableInit(&classInfo.fields);
-  
+
   // Set up symbol buffers to track duplicate static and instance methods.
   wrenIntBufferInit(&classInfo.methods);
   wrenIntBufferInit(&classInfo.staticMethods);
   // REVATE EXTENSION: initialize field defaults counter.
   classInfo.numFieldDefaults = 0;
+  // REVATE EXTENSION (§6a): record the with-clause names on the class
+  // info so the override-validation payload can reference them, and
+  // initialise the override tracking buffers.
+  classInfo.numWithMixins = numMixins;
+  for (int i = 0; i < numMixins; i++)
+  {
+    classInfo.withMixinNames[i]    = mixinTokens[i].start;
+    classInfo.withMixinNameLens[i] = mixinTokens[i].length;
+  }
+  classInfo.numPendingOverrides = 0;
+  classInfo.numOverrideMethods  = 0;
   compiler->enclosingClass = &classInfo;
 
   // Compile the method definitions.
   consume(compiler, TOKEN_LEFT_BRACE, "Expect '{' after class declaration.");
   matchLine(compiler);
+
+  // REVATE EXTENSION (§6c): optional `defaults { ... }` block at the
+  // top of the class body.  `defaults` is a context-sensitive keyword
+  // — only recognized here, never reserved at module scope.  At most
+  // one block per class.
+  //
+  // The block runs at class-definition time, AFTER all CODE_BIND_MIXIN
+  // (so the mixin's own defaults have been merged into the host's
+  // template) and BEFORE CODE_VALIDATE_OVERRIDES (so the class state
+  // is fully wired when validation runs).
+  bool sawDefaults = false;
+  while (peek(compiler) == TOKEN_NAME &&
+         compiler->parser->current.length == 8 &&
+         memcmp(compiler->parser->current.start, "defaults", 8) == 0 &&
+         peekNext(compiler) == TOKEN_LEFT_BRACE)
+  {
+    if (sawDefaults)
+    {
+      error(compiler,
+            "A class may have at most one 'defaults' block.");
+      // Consume the identifier so the loop can attempt to parse and
+      // surface inner errors too, then break out.
+    }
+    sawDefaults = true;
+
+    // Consume the 'defaults' identifier.
+    nextToken(compiler->parser);
+
+    // Load the class so MIXIN_FIELD_DEFAULT can PEEK it.
+    if (!isForeign)
+    {
+      loadVariable(compiler, classVariable);
+      defaultsBlock(compiler);
+      emitOp(compiler, CODE_POP);
+    }
+    else
+    {
+      // Foreign classes can't carry instance fields, so a defaults
+      // block makes no sense.  Surface a clean error and skip past
+      // the block.
+      error(compiler,
+            "Foreign classes cannot have a 'defaults' block.");
+      // Best-effort skip: consume until the matching '}'.
+      int depth = 0;
+      while (peek(compiler) != TOKEN_EOF)
+      {
+        if (match(compiler, TOKEN_LEFT_BRACE))  { depth++; continue; }
+        if (peek(compiler) == TOKEN_RIGHT_BRACE)
+        {
+          if (--depth <= 0) { nextToken(compiler->parser); break; }
+        }
+        nextToken(compiler->parser);
+      }
+    }
+
+    matchLine(compiler);
+  }
 
   while (!match(compiler, TOKEN_RIGHT_BRACE))
   {
@@ -4753,6 +5235,16 @@ static void classDefinition(Compiler* compiler, bool isForeign)
       emitByteArg(compiler, CODE_FIELD_DEFAULT, classInfo.fieldDefaultSlot[i]);
     }
     emitOp(compiler, CODE_POP);
+  }
+
+  // REVATE EXTENSION (§6a): @override(MixinName) validation.  We must
+  // emit this AFTER CODE_BIND_MIXIN (so the mixin pointers are on the
+  // class) and AFTER all CODE_METHOD_INSTANCE / CODE_METHOD_STATIC for
+  // class-declared methods (so we can distinguish shadowed slots).
+  // Both conditions hold at this point.
+  if (!isForeign)
+  {
+    emitOverrideValidationPayload(compiler, &classInfo, classVariable);
   }
 
   // Update the class with the number of fields.
@@ -4947,6 +5439,9 @@ ObjFn* wrenCompile(WrenVM* vm, ObjModule* module, const char* source,
 
   parser.printErrors = printErrors;
   parser.hasError = false;
+  // REVATE EXTENSION (§6a): pragma defaults off; set when a top-level
+  // @no_override_warnings attribute is parsed.
+  parser.noOverrideWarnings = false;
 
   // Read the first token into next
   nextToken(&parser);
@@ -5081,14 +5576,19 @@ void wrenMarkCompiler(WrenVM* vm, Compiler* compiler)
     {
       wrenBlackenSymbolTable(vm, &compiler->enclosingClass->fields);
 
-      if(compiler->enclosingClass->methodAttributes != NULL) 
+      if(compiler->enclosingClass->methodAttributes != NULL)
       {
         wrenGrayObj(vm, (Obj*)compiler->enclosingClass->methodAttributes);
       }
-      if(compiler->enclosingClass->classAttributes != NULL) 
+      if(compiler->enclosingClass->classAttributes != NULL)
       {
         wrenGrayObj(vm, (Obj*)compiler->enclosingClass->classAttributes);
       }
+
+      // REVATE EXTENSION (§6a): override-tracking arrays hold raw
+      // pointers into the parser source buffer (for mixin names) and
+      // into a fixed in-struct char buffer (for signatures).  Neither
+      // points at a GC-managed object, so nothing extra to gray here.
     }
     
     compiler = compiler->parent;
@@ -5254,6 +5754,225 @@ static void copyAttributes(Compiler* compiler, ObjMap* into)
   }
   
   wrenMapClear(vm, compiler->attributes);
+}
+
+// REVATE EXTENSION (§6a): snapshot any @override(MixinName, ...) keys
+// from the just-copied method attributes into the per-class override
+// tracking buffer.  Each call corresponds to one class method.  When
+// the class body is fully parsed, emitOverrideValidationPayload(...)
+// walks these snapshots to build a Wren-side validation map.
+//
+// The full signature used to key the method attribute is
+//   "<foreign? >static? <sig>"
+// (matching the format copyMethodAttributes uses).  We mirror that here.
+//
+// Why snapshot rather than read out of methodAttributes at emission
+// time?  The signature key in methodAttributes includes the "foreign "
+// / "static " prefixes, which the validation map doesn't need; and we
+// also want to record the static-ness flag separately for the runtime
+// dispatch.  Doing the read once, at method-declaration time, is the
+// cheapest place — `methodAttr` is freshly populated and on the
+// methodAttributes map directly.
+static void recordOverrideTargets(Compiler* compiler, const char* name,
+                                  int length, bool isStatic, bool isForeign)
+{
+  ClassInfo* classInfo = compiler->enclosingClass;
+  if (classInfo == NULL) return;
+
+  // Only worth recording when this class actually has mixins.  Without
+  // mixins, there's nothing to shadow and nothing to validate.  The
+  // exception is when the user wrote an @override annotation — but
+  // since recordOverrideTargets only inspects methodAttributes via the
+  // override group, that case still produces an entry below (because
+  // methodAttributes will have been allocated by copyMethodAttributes
+  // when the @override line was parsed).  Bail early only when the
+  // class has neither mixins nor any method attributes.
+  if (classInfo->numWithMixins == 0 && classInfo->methodAttributes == NULL)
+    return;
+
+  // Reserve a slot for *every* class-declared method, regardless of
+  // whether it carries an @override annotation.  The runtime needs the
+  // full set so it can detect unannotated shadows.
+  if (classInfo->numOverrideMethods >= WREN_MAX_OVERRIDE_METHODS)
+  {
+    error(compiler,
+          "Class '%s' exceeds the override-tracked method cap of %d.",
+          &classInfo->name->value, WREN_MAX_OVERRIDE_METHODS);
+    return;
+  }
+  int slot = classInfo->numOverrideMethods++;
+
+  // Store the unprefixed signature (e.g. "takeDamage(_)") plus the
+  // static-ness flag separately, so the runtime side can match against
+  // mixin->methods straightforwardly.
+  int storedLen = length;
+  if (storedLen > (int)sizeof(classInfo->overrideMethodSigBuf[slot]) - 1)
+  {
+    storedLen = (int)sizeof(classInfo->overrideMethodSigBuf[slot]) - 1;
+  }
+  memcpy(classInfo->overrideMethodSigBuf[slot], name, storedLen);
+  classInfo->overrideMethodSigBuf[slot][storedLen] = '\0';
+  classInfo->overrideMethodSigLen[slot] = storedLen;
+  classInfo->overrideMethodIsStatic[slot] = isStatic;
+  classInfo->numOverrideTargets[slot] = 0;
+
+  // Pull any @override(...) entries out of the method's attribute map.
+  if (classInfo->methodAttributes == NULL) return;
+
+  WrenVM* vm = compiler->parser->vm;
+  char fullSig[MAX_METHOD_SIGNATURE + 8 + 7];
+  int  fullLen = length;
+  if (isForeign) fullLen += 8;
+  if (isStatic)  fullLen += 7;
+  const char* foreignPrefix = isForeign ? "foreign " : "";
+  const char* staticPrefix  = isStatic  ? "static "  : "";
+  sprintf(fullSig, "%s%s%.*s", foreignPrefix, staticPrefix, length, name);
+  fullSig[fullLen] = '\0';
+
+  Value key = wrenNewStringLength(vm, fullSig, fullLen);
+  wrenPushRoot(vm, AS_OBJ(key));
+  Value methodAttrVal = wrenMapGet(classInfo->methodAttributes, key);
+  wrenPopRoot(vm);
+  if (IS_UNDEFINED(methodAttrVal)) return;
+  if (!IS_MAP(methodAttrVal)) return;
+  ObjMap* methodAttr = AS_MAP(methodAttrVal);
+
+  Value overrideGroupKey = wrenNewStringLength(vm, "override", 8);
+  wrenPushRoot(vm, AS_OBJ(overrideGroupKey));
+  Value overrideGroupVal = wrenMapGet(methodAttr, overrideGroupKey);
+  wrenPopRoot(vm);
+  if (IS_UNDEFINED(overrideGroupVal)) return;
+  if (!IS_MAP(overrideGroupVal)) return;
+  ObjMap* overrideGroup = AS_MAP(overrideGroupVal);
+
+  for (uint32_t i = 0; i < overrideGroup->capacity; i++)
+  {
+    const MapEntry* e = &overrideGroup->entries[i];
+    if (IS_UNDEFINED(e->key)) continue;
+    if (!IS_STRING(e->key)) continue;
+    ObjString* mixinName = AS_STRING(e->key);
+    int t = classInfo->numOverrideTargets[slot];
+    if (t >= WREN_MAX_OVERRIDES_PER_METHOD)
+    {
+      error(compiler,
+            "Method '%s' on class '%s' has more than %d @override targets.",
+            name, &classInfo->name->value,
+            WREN_MAX_OVERRIDES_PER_METHOD);
+      break;
+    }
+    classInfo->overrideMethodTargets[slot][t]    = mixinName->value;
+    classInfo->overrideMethodTargetLens[slot][t] = mixinName->length;
+    classInfo->numOverrideTargets[slot]++;
+  }
+}
+
+// REVATE EXTENSION (§6a): emit the runtime override-validation payload.
+//
+// Bytecode layout produced:
+//
+//   <load class>
+//   <build validation map>           ; pushes one value
+//   CODE_VALIDATE_OVERRIDES          ; pops the map and the class, then
+//                                    ; reports any diagnostics
+//
+// Net stack effect over the whole sequence: 0 (we leave nothing
+// behind).  The stated stack effect of CODE_VALIDATE_OVERRIDES is -1
+// because, like CODE_END_CLASS, it pops two values and pushes none.
+//
+// Map shape:
+//   {
+//     "noOverrideWarnings": Bool,
+//     "withMixins":         [String, String, ...],
+//     "classMethods":       Map<sig -> Map{"static": Bool,
+//                                          "overrides": [String, ...]}>
+//   }
+//
+// Only emitted when the class has at least one mixin in its `with`
+// clause OR at least one tracked @override annotation (the latter is
+// needed for the "@override on a class without `with`" error case).
+static void emitOverrideValidationPayload(Compiler* compiler,
+                                          ClassInfo* classInfo,
+                                          Variable classVariable)
+{
+  if (classInfo->numWithMixins == 0 && classInfo->numOverrideMethods == 0)
+    return;
+
+  WrenVM* vm = compiler->parser->vm;
+
+  // Load class first so it sits BELOW the validation map on the stack.
+  loadVariable(compiler, classVariable);
+
+  // Outer Map.
+  loadCoreVariable(compiler, "Map");
+  callMethod(compiler, 0, "new()", 5);
+
+  // ── noOverrideWarnings ───────────────────────────────────────────
+  emitConstant(compiler, wrenNewStringLength(vm, "noOverrideWarnings", 18));
+  if (compiler->parser->noOverrideWarnings)
+    emitOp(compiler, CODE_TRUE);
+  else
+    emitOp(compiler, CODE_FALSE);
+  callMethod(compiler, 2, "addCore_(_,_)", 13);
+
+  // ── withMixins ───────────────────────────────────────────────────
+  emitConstant(compiler, wrenNewStringLength(vm, "withMixins", 10));
+  loadCoreVariable(compiler, "List");
+  callMethod(compiler, 0, "new()", 5);
+  for (int i = 0; i < classInfo->numWithMixins; i++)
+  {
+    emitConstant(compiler,
+                 wrenNewStringLength(vm,
+                                     classInfo->withMixinNames[i],
+                                     classInfo->withMixinNameLens[i]));
+    callMethod(compiler, 1, "addCore_(_)", 11);
+  }
+  callMethod(compiler, 2, "addCore_(_,_)", 13);
+
+  // ── classMethods ─────────────────────────────────────────────────
+  emitConstant(compiler, wrenNewStringLength(vm, "classMethods", 12));
+  loadCoreVariable(compiler, "Map");
+  callMethod(compiler, 0, "new()", 5);
+  for (int i = 0; i < classInfo->numOverrideMethods; i++)
+  {
+    // Key: signature without prefix.
+    emitConstant(compiler,
+                 wrenNewStringLength(vm,
+                                     classInfo->overrideMethodSigBuf[i],
+                                     classInfo->overrideMethodSigLen[i]));
+
+    // Value: inner Map.
+    loadCoreVariable(compiler, "Map");
+    callMethod(compiler, 0, "new()", 5);
+
+    //   "static" → Bool
+    emitConstant(compiler, wrenNewStringLength(vm, "static", 6));
+    if (classInfo->overrideMethodIsStatic[i])
+      emitOp(compiler, CODE_TRUE);
+    else
+      emitOp(compiler, CODE_FALSE);
+    callMethod(compiler, 2, "addCore_(_,_)", 13);
+
+    //   "overrides" → [String, ...]
+    emitConstant(compiler, wrenNewStringLength(vm, "overrides", 9));
+    loadCoreVariable(compiler, "List");
+    callMethod(compiler, 0, "new()", 5);
+    for (int j = 0; j < classInfo->numOverrideTargets[i]; j++)
+    {
+      emitConstant(compiler,
+                   wrenNewStringLength(vm,
+                                       classInfo->overrideMethodTargets[i][j],
+                                       classInfo->overrideMethodTargetLens[i][j]));
+      callMethod(compiler, 1, "addCore_(_)", 11);
+    }
+    callMethod(compiler, 2, "addCore_(_,_)", 13);
+
+    // Add inner map under signature key.
+    callMethod(compiler, 2, "addCore_(_,_)", 13);
+  }
+  callMethod(compiler, 2, "addCore_(_,_)", 13);
+
+  // Stack now: [..., class, validationMap].  Emit the opcode.
+  emitOp(compiler, CODE_VALIDATE_OVERRIDES);
 }
 
 // Copy the current attributes stored in the compiler into the method specific

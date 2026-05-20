@@ -307,7 +307,74 @@ static int dumpInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
     }
     case CODE_BIND_MIXIN: printf("BIND_MIXIN\n"); break;
 
+    case CODE_VALIDATE_OVERRIDES: printf("VALIDATE_OVERRIDES\n"); break;
+
+    // REVATE EXTENSION (§6b): my.MixinName.method(args) dispatch.
+    case CODE_INVOKE_MIXIN_METHOD_0:
+    case CODE_INVOKE_MIXIN_METHOD_1:
+    case CODE_INVOKE_MIXIN_METHOD_2:
+    case CODE_INVOKE_MIXIN_METHOD_3:
+    case CODE_INVOKE_MIXIN_METHOD_4:
+    case CODE_INVOKE_MIXIN_METHOD_5:
+    case CODE_INVOKE_MIXIN_METHOD_6:
+    case CODE_INVOKE_MIXIN_METHOD_7:
+    case CODE_INVOKE_MIXIN_METHOD_8:
+    case CODE_INVOKE_MIXIN_METHOD_9:
+    case CODE_INVOKE_MIXIN_METHOD_10:
+    case CODE_INVOKE_MIXIN_METHOD_11:
+    case CODE_INVOKE_MIXIN_METHOD_12:
+    case CODE_INVOKE_MIXIN_METHOD_13:
+    case CODE_INVOKE_MIXIN_METHOD_14:
+    case CODE_INVOKE_MIXIN_METHOD_15:
+    case CODE_INVOKE_MIXIN_METHOD_16:
+    {
+      int numArgs = bytecode[i - 1] - CODE_INVOKE_MIXIN_METHOD_0;
+      int mixinNameConst = READ_SHORT();
+      int symbol         = READ_SHORT();
+      printf("MY_CALL_%-9d %5d '", numArgs, mixinNameConst);
+      wrenDumpValue(fn->constants.data[mixinNameConst]);
+      printf("'.%s\n", vm->methodNames.data[symbol]->value);
+      break;
+    }
+
+    // REVATE EXTENSION (§6b): my.MixinName.field load/store.
+    case CODE_LOAD_MIXIN_FIELD_THIS:
+    {
+      int mixinNameConst = READ_SHORT();
+      int fieldNameConst = READ_SHORT();
+      printf("%-16s '", "MY_LOAD_FIELD");
+      wrenDumpValue(fn->constants.data[mixinNameConst]);
+      printf("'.");
+      wrenDumpValue(fn->constants.data[fieldNameConst]);
+      printf("\n");
+      break;
+    }
+    case CODE_STORE_MIXIN_FIELD_THIS:
+    {
+      int mixinNameConst = READ_SHORT();
+      int fieldNameConst = READ_SHORT();
+      printf("%-16s '", "MY_STORE_FIELD");
+      wrenDumpValue(fn->constants.data[mixinNameConst]);
+      printf("'.");
+      wrenDumpValue(fn->constants.data[fieldNameConst]);
+      printf("\n");
+      break;
+    }
+
     case CODE_FIELD_DEFAULT: BYTE_INSTRUCTION("FIELD_DEFAULT");
+
+    // REVATE EXTENSION (§6c): per-class mixin field default.
+    case CODE_MIXIN_FIELD_DEFAULT:
+    {
+      int mixinNameConst = READ_SHORT();
+      int fieldNameConst = READ_SHORT();
+      printf("%-16s '", "MIXIN_FIELD_DEF");
+      wrenDumpValue(fn->constants.data[mixinNameConst]);
+      printf("'.");
+      wrenDumpValue(fn->constants.data[fieldNameConst]);
+      printf("\n");
+      break;
+    }
 
     case CODE_METHOD_INSTANCE:
     {

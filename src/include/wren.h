@@ -111,7 +111,13 @@ typedef enum
   WREN_ERROR_RUNTIME,
 
   // One entry of a runtime error's stack trace.
-  WREN_ERROR_STACK_TRACE
+  WREN_ERROR_STACK_TRACE,
+
+  // REVATE EXTENSION: a non-fatal diagnostic emitted at compile time or
+  // when a class finishes binding its mixins.  Programs continue to run
+  // after a warning, but the host-side error callback receives it so
+  // editor consoles, tests, and lint pipelines can surface it.
+  WREN_ERROR_WARNING
 } WrenErrorType;
 
 // Reports an error to the user.

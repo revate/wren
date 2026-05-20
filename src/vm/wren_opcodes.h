@@ -212,6 +212,116 @@ OPCODE(BIND_MIXIN, -2)
 // runtime).  Pops the value but leaves the class.
 OPCODE(FIELD_DEFAULT, -1)
 
+// REVATE EXTENSION (§6b): Invoke a method on a specific mixin's namespace
+// from inside a class method body — the runtime side of
+// `my.MixinName.method(args)`.
+//
+// Operands: (mixinNameConst : short, methodSymbol : short)
+//   mixinNameConst   — constant-pool index of an ObjString naming the
+//                      mixin (e.g. "Health"); compared by name against
+//                      classObj->mixins[].name at the call site.
+//   methodSymbol     — VM-wide method-name symbol (same space as
+//                      CODE_CALL_<n>).
+//
+// Stack: receiver + N args on top.  The receiver (this) is read from
+// the bottom of the args window, exactly like CODE_CALL_<n>; the call
+// runs the mixin's offset-adjusted clone — kept in
+// classObj->mixinMethods[i] — so `my.M.foo()` reaches M's original
+// body even when the host class shadows the slot.
+//
+// Stack effect mirrors CODE_CALL_<n>: -N (the args are consumed,
+// receiver slot becomes the return value).
+//
+// Runtime errors (all WREN_ERROR_COMPILE for diagnostic consistency):
+//   - mixin name is not in `this`'s class's `with` list
+//     (compile-time guards make this unreachable from valid code;
+//     here as defense in depth)
+//   - the mixin does not declare the named method
+OPCODE(INVOKE_MIXIN_METHOD_0,   0)
+OPCODE(INVOKE_MIXIN_METHOD_1,  -1)
+OPCODE(INVOKE_MIXIN_METHOD_2,  -2)
+OPCODE(INVOKE_MIXIN_METHOD_3,  -3)
+OPCODE(INVOKE_MIXIN_METHOD_4,  -4)
+OPCODE(INVOKE_MIXIN_METHOD_5,  -5)
+OPCODE(INVOKE_MIXIN_METHOD_6,  -6)
+OPCODE(INVOKE_MIXIN_METHOD_7,  -7)
+OPCODE(INVOKE_MIXIN_METHOD_8,  -8)
+OPCODE(INVOKE_MIXIN_METHOD_9,  -9)
+OPCODE(INVOKE_MIXIN_METHOD_10, -10)
+OPCODE(INVOKE_MIXIN_METHOD_11, -11)
+OPCODE(INVOKE_MIXIN_METHOD_12, -12)
+OPCODE(INVOKE_MIXIN_METHOD_13, -13)
+OPCODE(INVOKE_MIXIN_METHOD_14, -14)
+OPCODE(INVOKE_MIXIN_METHOD_15, -15)
+OPCODE(INVOKE_MIXIN_METHOD_16, -16)
+
+// REVATE EXTENSION (§6b): load a mixin-namespaced field from `this`.
+//
+// Operands: (mixinNameConst : short, fieldNameConst : short)
+// Stack effect: +1 (pushes the loaded value).
+//
+// The VM finds the named mixin's slot in
+// `wrenGetClassInline(this)->mixins[]`, looks up the field name in
+// that mixin's own `fields` symbol table, adds the host's
+// `mixinFieldOffsets[slot]`, and emits a regular field load against
+// `this` at the resulting offset.
+OPCODE(LOAD_MIXIN_FIELD_THIS,  1)
+
+// REVATE EXTENSION (§6b): store the top-of-stack into a mixin-namespaced
+// field on `this`.  Does NOT pop the value (same convention as
+// CODE_STORE_FIELD_THIS).
+//
+// Operands: (mixinNameConst : short, fieldNameConst : short)
+// Stack effect: 0.
+OPCODE(STORE_MIXIN_FIELD_THIS, 0)
+
+// REVATE EXTENSION (§6c): Stores a per-class mixin field default on
+// the class template.  Runs once, at class-definition time, after
+// CODE_BIND_MIXIN has merged the mixin's own defaults into the host.
+//
+// Stack: ..., class, value → ..., class
+//
+// Operands: (mixinNameConst : short, fieldNameConst : short)
+//   mixinNameConst   — constant-pool index of an ObjString naming a
+//                      mixin in the class's `with` list.
+//   fieldNameConst   — constant-pool index of an ObjString naming a
+//                      field declared on that mixin (public or
+//                      private).
+//
+// The VM walks classObj->mixins[] for the named mixin, resolves the
+// per-mixin field slot index by scanning the mixin's synthesized
+// getter for `LOAD_FIELD_THIS <slot>` (same machinery as
+// LOAD_MIXIN_FIELD_THIS), then writes the popped value into
+// classObj->fieldDefaults[mixinFieldOffsets[slot] + fieldIdx].
+// Pops the value but leaves the class on the stack so a series of
+// CODE_MIXIN_FIELD_DEFAULT emissions can target the same class.
+OPCODE(MIXIN_FIELD_DEFAULT, -1)
+
+// REVATE EXTENSION (§6a): Validates @override(MixinName) annotations and
+// emits compile-time warnings for unannotated shadows of mixin methods.
+//
+// Stack: ..., class, validationMap → ..., class
+//   (validationMap is a Wren Map produced by the compiler; the class is
+//    left on the stack so the caller may continue patching it).
+//
+// The validation map has the shape:
+//   {
+//     "noOverrideWarnings": Bool,
+//     "withMixins": [String, String, ...],   // names in `with` order
+//     "classMethods": {
+//       "<full sig>": {
+//         "static": Bool,
+//         "overrides": [String, String, ...] // mixin names from @override
+//       },
+//       ...
+//     }
+//   }
+//
+// The opcode walks classObj->mixins[] and, for each (mixin, method)
+// pair, performs the diagnostic logic described in
+// docs/specs/wren_language_extensions.md §6.
+OPCODE(VALIDATE_OVERRIDES, -1)
+
 // This is executed at the end of the module's body. Pushes NULL onto the stack
 // as the "return value" of the import statement and stores the module as the
 // most recently imported one.

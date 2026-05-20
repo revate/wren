@@ -55,6 +55,9 @@ ObjClass* wrenNewSingleClass(WrenVM* vm, int numFields, ObjString* name)
   classObj->mixins = NULL;
   classObj->numMixins = 0;
   classObj->fieldDefaults = NULL;
+  // REVATE EXTENSION (§6b): per-mixin offset / method tables for my.X
+  classObj->mixinFieldOffsets = NULL;
+  classObj->mixinMethods      = NULL;
 
   wrenPushRoot(vm, (Obj*)classObj);
   wrenMethodBufferInit(&classObj->methods);
@@ -185,6 +188,7 @@ static int mixinGetArgBytes(const uint8_t* bytecode,
     case CODE_END_MODULE:
     case CODE_END_CLASS:
     case CODE_BIND_MIXIN:
+    case CODE_VALIDATE_OVERRIDES:
       return 0;
 
     case CODE_LOAD_LOCAL:
@@ -232,6 +236,32 @@ static int mixinGetArgBytes(const uint8_t* bytecode,
     case CODE_IMPORT_MODULE:
     case CODE_IMPORT_VARIABLE:
       return 2;
+
+    // REVATE EXTENSION (§6b): my.MixinName.field / my.MixinName.method.
+    // Each carries (mixinNameConst:short, methodSymOrFieldName:short).
+    case CODE_INVOKE_MIXIN_METHOD_0:
+    case CODE_INVOKE_MIXIN_METHOD_1:
+    case CODE_INVOKE_MIXIN_METHOD_2:
+    case CODE_INVOKE_MIXIN_METHOD_3:
+    case CODE_INVOKE_MIXIN_METHOD_4:
+    case CODE_INVOKE_MIXIN_METHOD_5:
+    case CODE_INVOKE_MIXIN_METHOD_6:
+    case CODE_INVOKE_MIXIN_METHOD_7:
+    case CODE_INVOKE_MIXIN_METHOD_8:
+    case CODE_INVOKE_MIXIN_METHOD_9:
+    case CODE_INVOKE_MIXIN_METHOD_10:
+    case CODE_INVOKE_MIXIN_METHOD_11:
+    case CODE_INVOKE_MIXIN_METHOD_12:
+    case CODE_INVOKE_MIXIN_METHOD_13:
+    case CODE_INVOKE_MIXIN_METHOD_14:
+    case CODE_INVOKE_MIXIN_METHOD_15:
+    case CODE_INVOKE_MIXIN_METHOD_16:
+    case CODE_LOAD_MIXIN_FIELD_THIS:
+    case CODE_STORE_MIXIN_FIELD_THIS:
+    // REVATE EXTENSION (§6c): per-class mixin field default.
+    // (mixinNameConst:short, fieldNameConst:short).
+    case CODE_MIXIN_FIELD_DEFAULT:
+      return 4;
 
     case CODE_SUPER_0:
     case CODE_SUPER_1:
@@ -385,22 +415,53 @@ void wrenBindMixin(WrenVM* vm, ObjClass* classObj, ObjClass* mixin)
   }
 
   // 3. Copy mixin methods — class's own methods win on conflict.
+  //
+  // REVATE EXTENSION (§6b): build a per-mixin shadow table at
+  // `mixinClonedMethods` so `my.MixinName.method(...)` can still
+  // reach the mixin's offset-adjusted body even when the class
+  // shadows the slot.  The table holds the SAME closure pointers
+  // we write into classObj->methods for unshadowed slots, plus
+  // standalone clones for slots the class shadows.
+  MethodBuffer mixinClonedMethods;
+  wrenMethodBufferInit(&mixinClonedMethods);
   for (int i = 0; i < mixin->methods.count; i++)
   {
     Method* mixinMethod = &mixin->methods.data[i];
-    if (mixinMethod->type == METHOD_NONE) continue;
+    if (mixinMethod->type == METHOD_NONE)
+    {
+      Method none;
+      none.type = METHOD_NONE;
+      while (mixinClonedMethods.count < i + 1)
+        wrenMethodBufferWrite(vm, &mixinClonedMethods, none);
+      continue;
+    }
 
-    // If the class already defines this method, the class wins.
-    if (i < classObj->methods.count &&
-        classObj->methods.data[i].type != METHOD_NONE) continue;
-
-    // Clone the method with adjusted field offsets.
+    // Clone the method with adjusted field offsets — produce the
+    // clone once and use it for both the host slot (when not
+    // shadowed) and the per-mixin shadow table.
     Method adjusted = *mixinMethod;
     if (fieldOffset > 0 && adjusted.type == METHOD_BLOCK)
     {
       adjusted.as.closure = wrenCloneClosureWithFieldOffset(
           vm, adjusted.as.closure, fieldOffset);
     }
+
+    // Record into the per-mixin shadow table FIRST so it's
+    // populated regardless of host-class shadowing decisions.
+    while (mixinClonedMethods.count < i)
+    {
+      Method none;
+      none.type = METHOD_NONE;
+      wrenMethodBufferWrite(vm, &mixinClonedMethods, none);
+    }
+    wrenMethodBufferWrite(vm, &mixinClonedMethods, adjusted);
+
+    // If the class already defines this method, the class wins on
+    // the regular dispatch path — but the per-mixin table above
+    // still has the adjusted clone for `my.M.method(...)`.
+    if (i < classObj->methods.count &&
+        classObj->methods.data[i].type != METHOD_NONE) continue;
+
     wrenBindMethod(vm, classObj, i, adjusted);
   }
 
@@ -420,15 +481,41 @@ void wrenBindMixin(WrenVM* vm, ObjClass* classObj, ObjClass* mixin)
     }
   }
 
-  // 3. Store mixin reference for hasMixin() checks.
+  // 3. Store mixin reference for hasMixin() checks, the per-mixin
+  //    field-base offset (§6b), and the per-mixin method shadow
+  //    table (§6b).
   if (classObj->mixins == NULL)
   {
     classObj->mixins = ALLOCATE_ARRAY(vm, ObjClass*, MAX_MIXINS);
     for (int i = 0; i < MAX_MIXINS; i++) classObj->mixins[i] = NULL;
   }
+  // REVATE EXTENSION (§6b): allocate parallel offset / method tables.
+  if (classObj->mixinFieldOffsets == NULL)
+  {
+    classObj->mixinFieldOffsets = ALLOCATE_ARRAY(vm, int, MAX_MIXINS);
+    for (int i = 0; i < MAX_MIXINS; i++) classObj->mixinFieldOffsets[i] = 0;
+  }
+  if (classObj->mixinMethods == NULL)
+  {
+    classObj->mixinMethods =
+        ALLOCATE_ARRAY(vm, MethodBuffer, MAX_MIXINS);
+    for (int i = 0; i < MAX_MIXINS; i++)
+      wrenMethodBufferInit(&classObj->mixinMethods[i]);
+  }
+
   if (classObj->numMixins < MAX_MIXINS)
   {
-    classObj->mixins[classObj->numMixins++] = mixin;
+    int slot = classObj->numMixins++;
+    classObj->mixins[slot]            = mixin;
+    classObj->mixinFieldOffsets[slot] = fieldOffset;
+    // Move the freshly-built shadow-table buffer into the slot.
+    // We allocated it locally above so the slot owns it from here.
+    classObj->mixinMethods[slot]      = mixinClonedMethods;
+  }
+  else
+  {
+    // Out of mixin slots — drop the buffer we built locally.
+    wrenMethodBufferClear(vm, &mixinClonedMethods);
   }
 }
 // ─────────────────────────────────────────────────────── end REVATE EXTENSION
@@ -1346,6 +1433,24 @@ static void blackenClass(WrenVM* vm, ObjClass* classObj)
     wrenGrayObj(vm, (Obj*)classObj->mixins[i]);
   }
 
+  // REVATE EXTENSION (§6b): trace per-mixin method clones.  These
+  // hold closures with adjusted field offsets that the regular
+  // methods.data tracing also covers in the un-shadowed case, but
+  // for shadowed slots the clone is reachable ONLY through here.
+  if (classObj->mixinMethods != NULL)
+  {
+    for (int i = 0; i < classObj->numMixins; i++)
+    {
+      MethodBuffer* mb = &classObj->mixinMethods[i];
+      for (int j = 0; j < mb->count; j++)
+      {
+        Method* m = &mb->data[j];
+        if (m->type == METHOD_BLOCK && m->as.closure != NULL)
+          wrenGrayObj(vm, (Obj*)m->as.closure);
+      }
+    }
+  }
+
   // REVATE EXTENSION: trace field defaults (may contain strings, etc.).
   if (classObj->fieldDefaults != NULL)
   {
@@ -1358,6 +1463,14 @@ static void blackenClass(WrenVM* vm, ObjClass* classObj)
   vm->bytesAllocated += classObj->methods.capacity * sizeof(Method);
   if (classObj->mixins != NULL)
     vm->bytesAllocated += 16 * sizeof(ObjClass*); // MAX_MIXINS
+  if (classObj->mixinFieldOffsets != NULL)
+    vm->bytesAllocated += 16 * sizeof(int);       // MAX_MIXINS
+  if (classObj->mixinMethods != NULL)
+  {
+    vm->bytesAllocated += 16 * sizeof(MethodBuffer); // MAX_MIXINS
+    for (int i = 0; i < classObj->numMixins; i++)
+      vm->bytesAllocated += classObj->mixinMethods[i].capacity * sizeof(Method);
+  }
   if (classObj->fieldDefaults != NULL)
     vm->bytesAllocated += classObj->numFields * sizeof(Value);
 }
@@ -1566,6 +1679,16 @@ void wrenFreeObj(WrenVM* vm, Obj* obj)
       wrenMethodBufferClear(vm, &((ObjClass*)obj)->methods);
       if (((ObjClass*)obj)->mixins != NULL)
         DEALLOCATE(vm, ((ObjClass*)obj)->mixins);
+      // REVATE EXTENSION (§6b): release per-mixin offset / method tables.
+      if (((ObjClass*)obj)->mixinFieldOffsets != NULL)
+        DEALLOCATE(vm, ((ObjClass*)obj)->mixinFieldOffsets);
+      if (((ObjClass*)obj)->mixinMethods != NULL)
+      {
+        ObjClass* c = (ObjClass*)obj;
+        for (int i = 0; i < c->numMixins; i++)
+          wrenMethodBufferClear(vm, &c->mixinMethods[i]);
+        DEALLOCATE(vm, c->mixinMethods);
+      }
       if (((ObjClass*)obj)->fieldDefaults != NULL)
         DEALLOCATE(vm, ((ObjClass*)obj)->fieldDefaults);
       break;

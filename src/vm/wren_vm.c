@@ -623,7 +623,7 @@ static void bindForeignClass(WrenVM* vm, ObjClass* classObj, ObjModule* module)
 // This process handles moving the attribute data for a class from
 // compile time to runtime, since it now has all the attributes associated
 // with a class, including for methods.
-static void endClass(WrenVM* vm) 
+static void endClass(WrenVM* vm)
 {
   // Pull the attributes and class off the stack
   Value attributes = vm->fiber->stackTop[-2];
@@ -634,6 +634,256 @@ static void endClass(WrenVM* vm)
 
   ObjClass* classObj = AS_CLASS(classValue);
     classObj->attributes = attributes;
+}
+
+// REVATE EXTENSION (§6a) — implementation of CODE_VALIDATE_OVERRIDES.
+//
+// The opcode pops a Wren Map (built by the compiler) and the class
+// being validated.  It reports diagnostics (warnings and compile-time
+// errors) via vm->config.errorFn, in the same WREN_ERROR_COMPILE /
+// WREN_ERROR_WARNING channel the rest of the front-end uses.
+//
+// The expected map shape is documented at the opcode definition in
+// wren_opcodes.h.  The validation logic mirrors the design notes in
+// docs/specs/wren_language_extensions.md §6:
+//
+//   1. For every method M declared directly on the class:
+//        For each mixin K in `withMixins`:
+//          if K declares M (same symbol present on K->methods or
+//          K->obj.classObj->methods for static):
+//            if class's @override(K) for M is present  → ok, silent
+//            else if @no_override_warnings is set       → ok, silent
+//            else                                       → warning
+//   2. For every @override(K) annotation on a class method M:
+//        if K not in `withMixins`                       → error
+//        if K does not declare M                        → error
+//
+// The opcode never aborts the fiber on its own; it only reports
+// through errorFn.  Tests can therefore observe both warnings (which
+// allow the program to keep running) and errors (which the host can
+// treat as fatal as it sees fit) via the host's error sink.
+//
+// `noOverrideWarnings` silences case 1 only.  It does NOT silence the
+// explicit-error cases — getting those wrong is a programmer mistake,
+// not background noise.
+static void reportOverrideDiagnostic(WrenVM* vm, WrenErrorType type,
+                                     ObjString* moduleName,
+                                     const char* format, ...);
+
+// Look up a method symbol from a signature string.  Returns the symbol
+// or -1 if no such method has ever been declared in the VM.
+static int findMethodSymbol(WrenVM* vm, const char* sig, int len)
+{
+  return wrenSymbolTableFind(&vm->methodNames, sig, len);
+}
+
+// Returns true if [mixin] declares an instance method (isStatic = false)
+// or a static method (isStatic = true) for the given symbol.
+static bool mixinDeclaresSymbol(ObjClass* mixin, int symbol, bool isStatic)
+{
+  if (isStatic)
+  {
+    ObjClass* meta = mixin->obj.classObj;
+    if (meta == NULL) return false;
+    if (symbol < 0 || symbol >= meta->methods.count) return false;
+    return meta->methods.data[symbol].type != METHOD_NONE;
+  }
+  if (symbol < 0 || symbol >= mixin->methods.count) return false;
+  return mixin->methods.data[symbol].type != METHOD_NONE;
+}
+
+// Build a "Mixin.sig" qualifier for diagnostic messages.
+static void formatMixinMethod(char* buf, size_t bufLen,
+                              ObjString* mixinName,
+                              const char* sig, int sigLen,
+                              bool isStatic)
+{
+  const char* prefix = isStatic ? "static " : "";
+  snprintf(buf, bufLen, "%s.%s%.*s", mixinName->value, prefix, sigLen, sig);
+}
+
+static void validateOverrides(WrenVM* vm)
+{
+  // Stack: [..., class, validationMap]
+  Value mapValue   = vm->fiber->stackTop[-1];
+  Value classValue = vm->fiber->stackTop[-2];
+  vm->fiber->stackTop -= 2;
+
+  if (!IS_CLASS(classValue) || !IS_MAP(mapValue))
+  {
+    // Should never happen if the compiler is wired up right; bail
+    // silently to avoid masking the real issue with a confusing error.
+    return;
+  }
+
+  ObjClass* classObj = AS_CLASS(classValue);
+  ObjMap*   payload  = AS_MAP(mapValue);
+  ObjString* className = classObj->name;
+
+  // The fiber owns the current function; the module owns the function;
+  // the module's name is what we want to report alongside diagnostics.
+  ObjString* moduleName = NULL;
+  if (vm->fiber->numFrames > 0)
+  {
+    CallFrame* frame = &vm->fiber->frames[vm->fiber->numFrames - 1];
+    if (frame->closure != NULL && frame->closure->fn != NULL &&
+        frame->closure->fn->module != NULL)
+    {
+      moduleName = frame->closure->fn->module->name;
+    }
+  }
+
+  // ── extract scalar fields from payload ─────────────────────────────
+  Value vNoWarn = wrenMapGet(payload,
+      OBJ_VAL(wrenNewStringLength(vm, "noOverrideWarnings", 18)));
+  bool noOverrideWarnings = IS_BOOL(vNoWarn) ? AS_BOOL(vNoWarn) : false;
+
+  Value vWithMixins = wrenMapGet(payload,
+      OBJ_VAL(wrenNewStringLength(vm, "withMixins", 10)));
+  ObjList* withList = IS_LIST(vWithMixins) ? AS_LIST(vWithMixins) : NULL;
+
+  Value vClassMethods = wrenMapGet(payload,
+      OBJ_VAL(wrenNewStringLength(vm, "classMethods", 12)));
+  ObjMap* classMethods = IS_MAP(vClassMethods) ? AS_MAP(vClassMethods) : NULL;
+
+  if (classMethods == NULL || withList == NULL)
+  {
+    // Nothing to validate.
+    return;
+  }
+
+  // ── walk class-declared methods ────────────────────────────────────
+  for (uint32_t mi = 0; mi < classMethods->capacity; mi++)
+  {
+    const MapEntry* mEntry = &classMethods->entries[mi];
+    if (IS_UNDEFINED(mEntry->key)) continue;
+    if (!IS_STRING(mEntry->key))    continue;
+    if (!IS_MAP(mEntry->value))     continue;
+
+    ObjString* sigStr = AS_STRING(mEntry->key);
+    ObjMap*    info   = AS_MAP(mEntry->value);
+
+    Value vStatic = wrenMapGet(info,
+        OBJ_VAL(wrenNewStringLength(vm, "static", 6)));
+    bool isStatic = IS_BOOL(vStatic) ? AS_BOOL(vStatic) : false;
+
+    Value vOverrides = wrenMapGet(info,
+        OBJ_VAL(wrenNewStringLength(vm, "overrides", 9)));
+    ObjList* overrides = IS_LIST(vOverrides) ? AS_LIST(vOverrides) : NULL;
+
+    int symbol = findMethodSymbol(vm, sigStr->value, sigStr->length);
+    // If the symbol doesn't exist, the method was never registered;
+    // that's a deeper problem outside our scope, just skip.
+    if (symbol < 0) continue;
+
+    // ── case 2a/2b: validate each explicit @override(K) ──────────────
+    if (overrides != NULL)
+    {
+      for (int oi = 0; oi < overrides->elements.count; oi++)
+      {
+        Value vMixinName = overrides->elements.data[oi];
+        if (!IS_STRING(vMixinName)) continue;
+        ObjString* mixinName = AS_STRING(vMixinName);
+
+        // (2a) is `mixinName` in the with-list?
+        ObjClass* matchedMixin = NULL;
+        for (int wi = 0; wi < withList->elements.count; wi++)
+        {
+          Value vWith = withList->elements.data[wi];
+          if (!IS_STRING(vWith)) continue;
+          ObjString* withName = AS_STRING(vWith);
+          if (withName->length == mixinName->length &&
+              memcmp(withName->value, mixinName->value, withName->length) == 0)
+          {
+            if (wi < classObj->numMixins)
+              matchedMixin = classObj->mixins[wi];
+            break;
+          }
+        }
+
+        if (matchedMixin == NULL)
+        {
+          reportOverrideDiagnostic(vm, WREN_ERROR_COMPILE, moduleName,
+              "@override(%s) on '%s.%.*s' — '%s' is not in the `with` list.",
+              mixinName->value, className->value,
+              sigStr->length, sigStr->value,
+              mixinName->value);
+          continue;
+        }
+
+        // (2b) does the mixin actually declare this method?
+        if (!mixinDeclaresSymbol(matchedMixin, symbol, isStatic))
+        {
+          reportOverrideDiagnostic(vm, WREN_ERROR_COMPILE, moduleName,
+              "@override(%s) on '%s.%.*s' — '%s' does not declare '%.*s'.",
+              mixinName->value, className->value,
+              sigStr->length, sigStr->value,
+              mixinName->value,
+              sigStr->length, sigStr->value);
+          continue;
+        }
+      }
+    }
+
+    // ── case 1: unannotated-shadow warning ───────────────────────────
+    if (noOverrideWarnings) continue;
+
+    // Walk every mixin in the with list; if any declares this symbol,
+    // and the class did NOT carry @override(K) for it, emit a warning.
+    for (int wi = 0; wi < withList->elements.count && wi < classObj->numMixins; wi++)
+    {
+      Value vWith = withList->elements.data[wi];
+      if (!IS_STRING(vWith)) continue;
+      ObjString* withName = AS_STRING(vWith);
+      ObjClass*  mixin    = classObj->mixins[wi];
+      if (mixin == NULL) continue;
+      if (!mixinDeclaresSymbol(mixin, symbol, isStatic)) continue;
+
+      // Is there an explicit @override(K) for this method?
+      bool annotated = false;
+      if (overrides != NULL)
+      {
+        for (int oi = 0; oi < overrides->elements.count; oi++)
+        {
+          Value vMixinName = overrides->elements.data[oi];
+          if (!IS_STRING(vMixinName)) continue;
+          ObjString* on = AS_STRING(vMixinName);
+          if (on->length == withName->length &&
+              memcmp(on->value, withName->value, on->length) == 0)
+          {
+            annotated = true;
+            break;
+          }
+        }
+      }
+      if (annotated) continue;
+
+      reportOverrideDiagnostic(vm, WREN_ERROR_WARNING, moduleName,
+          "Method '%.*s' on class '%s' shadows mixin '%s.%.*s' without @override(%s).",
+          sigStr->length, sigStr->value,
+          className->value,
+          withName->value,
+          sigStr->length, sigStr->value,
+          withName->value);
+    }
+  }
+}
+
+static void reportOverrideDiagnostic(WrenVM* vm, WrenErrorType type,
+                                     ObjString* moduleName,
+                                     const char* format, ...)
+{
+  if (vm->config.errorFn == NULL) return;
+  char buffer[512];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buffer, sizeof(buffer), format, args);
+  va_end(args);
+  const char* modCstr = moduleName != NULL ? moduleName->value : "";
+  // Line number for these diagnostics is not tracked — the compiler
+  // emits CODE_VALIDATE_OVERRIDES at the end of the class body, so we
+  // don't have a precise origin line.  Pass 0 to indicate "unknown".
+  vm->config.errorFn(vm, type, modCstr, 0, buffer);
 }
 
 // Creates a new class.
@@ -957,6 +1207,173 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       DISPATCH();
     }
 
+    // REVATE EXTENSION (§6b): my.MixinName.field load.
+    CASE_CODE(LOAD_MIXIN_FIELD_THIS):
+    {
+      int mixinNameConst = READ_SHORT();
+      int fieldNameConst = READ_SHORT();
+      Value receiver = stackStart[0];
+      ObjClass* hostClass = wrenGetClassInline(vm, receiver);
+      ObjString* mixinName = AS_STRING(fn->constants.data[mixinNameConst]);
+      ObjString* fieldName = AS_STRING(fn->constants.data[fieldNameConst]);
+
+      // Find mixin slot on host.
+      int slot = -1;
+      for (int i = 0; i < hostClass->numMixins; i++)
+      {
+        ObjClass* m = hostClass->mixins[i];
+        if (m != NULL && m->name != NULL &&
+            m->name->length == mixinName->length &&
+            memcmp(m->name->value, mixinName->value,
+                   (size_t)mixinName->length) == 0)
+        {
+          slot = i;
+          break;
+        }
+      }
+      if (slot < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' is not on class '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(hostClass->name));
+        RUNTIME_ERROR();
+      }
+
+      // Look up field index on the mixin's own field table.
+      // Mixin classes carry a non-null `fieldDefaults` count via
+      // numFields; the symbol table lives on the compiler-side
+      // ClassInfo, but the runtime ObjClass doesn't carry it.  We
+      // instead consult the mixin's own ObjClass.numFields-bounded
+      // index by walking the host's field-default-key conventions —
+      // but field names aren't preserved on ObjClass at runtime
+      // either.  Instead we use a name-to-slot lookup table that
+      // mixin declarations stash on the mixin ObjClass at bind time.
+      //
+      // Phase 6b: mixin-field name lookup uses the mixin's
+      // symbol-named field table.  Field names ARE preserved through
+      // the bytecode constant pool of the mixin's own static
+      // initializer (CODE_FIELD_DEFAULT only carries the index, not
+      // the name), so we need a side-band.  For 6b we tag the mixin
+      // with a `fieldNames` table populated at mixin-definition time
+      // (see wrenBindMixin / wren_compiler.c).
+      //
+      // TEMPORARY (until that side-band lands): linearly scan
+      // mixin->methods for a getter named after the field and use
+      // that to derive the slot from the closure's LOAD_FIELD_THIS
+      // instruction.  This is robust for `public` fields (which
+      // always have a synthesized getter) but not for `private`
+      // fields.  Phase 6b ships getter-derived lookup with a TODO.
+      //
+      // Find the symbol for the bare field name (getter signature
+      // is just the field name with no parens).
+      int getterSym = wrenSymbolTableFind(&vm->methodNames,
+          fieldName->value, fieldName->length);
+      int fieldIdx = -1;
+      if (getterSym >= 0)
+      {
+        ObjClass* mixin = hostClass->mixins[slot];
+        if (getterSym < mixin->methods.count)
+        {
+          Method* gm = &mixin->methods.data[getterSym];
+          if (gm->type == METHOD_BLOCK && gm->as.closure != NULL)
+          {
+            // The getter's body is `LOAD_FIELD_THIS <slot> RETURN`.
+            ObjFn* gfn = gm->as.closure->fn;
+            for (int ip2 = 0; ip2 < gfn->code.count; )
+            {
+              uint8_t op = gfn->code.data[ip2];
+              if (op == CODE_LOAD_FIELD_THIS)
+              {
+                fieldIdx = gfn->code.data[ip2 + 1];
+                break;
+              }
+              ip2++;
+            }
+          }
+        }
+      }
+      if (fieldIdx < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' does not declare field '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(fieldName));
+        RUNTIME_ERROR();
+      }
+
+      int absSlot = hostClass->mixinFieldOffsets[slot] + fieldIdx;
+      ObjInstance* instance = AS_INSTANCE(receiver);
+      ASSERT(absSlot < instance->obj.classObj->numFields,
+             "Out of bounds mixin field.");
+      PUSH(instance->fields[absSlot]);
+      DISPATCH();
+    }
+
+    // REVATE EXTENSION (§6b): my.MixinName.field = value.
+    CASE_CODE(STORE_MIXIN_FIELD_THIS):
+    {
+      int mixinNameConst = READ_SHORT();
+      int fieldNameConst = READ_SHORT();
+      Value receiver = stackStart[0];
+      ObjClass* hostClass = wrenGetClassInline(vm, receiver);
+      ObjString* mixinName = AS_STRING(fn->constants.data[mixinNameConst]);
+      ObjString* fieldName = AS_STRING(fn->constants.data[fieldNameConst]);
+
+      int slot = -1;
+      for (int i = 0; i < hostClass->numMixins; i++)
+      {
+        ObjClass* m = hostClass->mixins[i];
+        if (m != NULL && m->name != NULL &&
+            m->name->length == mixinName->length &&
+            memcmp(m->name->value, mixinName->value,
+                   (size_t)mixinName->length) == 0)
+        { slot = i; break; }
+      }
+      if (slot < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' is not on class '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(hostClass->name));
+        RUNTIME_ERROR();
+      }
+
+      int getterSym = wrenSymbolTableFind(&vm->methodNames,
+          fieldName->value, fieldName->length);
+      int fieldIdx = -1;
+      if (getterSym >= 0)
+      {
+        ObjClass* mixin = hostClass->mixins[slot];
+        if (getterSym < mixin->methods.count)
+        {
+          Method* gm = &mixin->methods.data[getterSym];
+          if (gm->type == METHOD_BLOCK && gm->as.closure != NULL)
+          {
+            ObjFn* gfn = gm->as.closure->fn;
+            for (int ip2 = 0; ip2 < gfn->code.count; )
+            {
+              uint8_t op = gfn->code.data[ip2];
+              if (op == CODE_LOAD_FIELD_THIS)
+              { fieldIdx = gfn->code.data[ip2 + 1]; break; }
+              ip2++;
+            }
+          }
+        }
+      }
+      if (fieldIdx < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' does not declare field '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(fieldName));
+        RUNTIME_ERROR();
+      }
+
+      int absSlot = hostClass->mixinFieldOffsets[slot] + fieldIdx;
+      ObjInstance* instance = AS_INSTANCE(receiver);
+      ASSERT(absSlot < instance->obj.classObj->numFields,
+             "Out of bounds mixin field.");
+      instance->fields[absSlot] = PEEK();
+      DISPATCH();
+    }
+
     CASE_CODE(POP):   DROP(); DISPATCH();
     CASE_CODE(NULL):  PUSH(NULL_VAL); DISPATCH();
     CASE_CODE(FALSE): PUSH(FALSE_VAL); DISPATCH();
@@ -1040,6 +1457,76 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       // The superclass is stored in a constant.
       classObj = AS_CLASS(fn->constants.data[READ_SHORT()]);
       goto completeCall;
+
+    // REVATE EXTENSION (§6b): my.MixinName.method(args) explicit
+    // mixin dispatch.  The opcode carries (mixinNameConst, symbol);
+    // we resolve the mixin slot on the receiver's class and pluck
+    // the method out of the per-mixin shadow table so the original
+    // (field-offset-adjusted) clone runs, not whatever shadowing
+    // version the host class has at classObj->methods[symbol].
+    CASE_CODE(INVOKE_MIXIN_METHOD_0):
+    CASE_CODE(INVOKE_MIXIN_METHOD_1):
+    CASE_CODE(INVOKE_MIXIN_METHOD_2):
+    CASE_CODE(INVOKE_MIXIN_METHOD_3):
+    CASE_CODE(INVOKE_MIXIN_METHOD_4):
+    CASE_CODE(INVOKE_MIXIN_METHOD_5):
+    CASE_CODE(INVOKE_MIXIN_METHOD_6):
+    CASE_CODE(INVOKE_MIXIN_METHOD_7):
+    CASE_CODE(INVOKE_MIXIN_METHOD_8):
+    CASE_CODE(INVOKE_MIXIN_METHOD_9):
+    CASE_CODE(INVOKE_MIXIN_METHOD_10):
+    CASE_CODE(INVOKE_MIXIN_METHOD_11):
+    CASE_CODE(INVOKE_MIXIN_METHOD_12):
+    CASE_CODE(INVOKE_MIXIN_METHOD_13):
+    CASE_CODE(INVOKE_MIXIN_METHOD_14):
+    CASE_CODE(INVOKE_MIXIN_METHOD_15):
+    CASE_CODE(INVOKE_MIXIN_METHOD_16):
+    {
+      // Add one for the implicit receiver (this).
+      numArgs = instruction - CODE_INVOKE_MIXIN_METHOD_0 + 1;
+      int mixinNameConst = READ_SHORT();
+      symbol = READ_SHORT();
+
+      args = fiber->stackTop - numArgs;
+      // Receiver class — host class that has the mixin attached.
+      classObj = wrenGetClassInline(vm, args[0]);
+
+      // Find the mixin slot by name.
+      ObjString* mixinName = AS_STRING(fn->constants.data[mixinNameConst]);
+      int mxSlot = -1;
+      for (int i = 0; i < classObj->numMixins; i++)
+      {
+        ObjClass* m = classObj->mixins[i];
+        if (m != NULL && m->name != NULL &&
+            m->name->length == mixinName->length &&
+            memcmp(m->name->value, mixinName->value,
+                   (size_t)mixinName->length) == 0)
+        { mxSlot = i; break; }
+      }
+      if (mxSlot < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' is not on class '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(classObj->name));
+        RUNTIME_ERROR();
+      }
+
+      // Pluck the method out of the per-mixin shadow table.
+      MethodBuffer* mb = &classObj->mixinMethods[mxSlot];
+      if (symbol >= mb->count ||
+          (method = &mb->data[symbol])->type == METHOD_NONE)
+      {
+        ObjString* sigStr = vm->methodNames.data[symbol];
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' does not declare '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(sigStr));
+        RUNTIME_ERROR();
+      }
+      // Skip the standard visibility / foreign-redirect path —
+      // `my.M.method` is statically the same-class context as the
+      // calling method, so the call is implicitly private-allowed.
+      goto dispatchMethod;
+    }
 
     completeCall:
       // If the class's method table doesn't include the symbol, bail.
@@ -1463,6 +1950,14 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       DISPATCH();
     }
 
+    // REVATE EXTENSION (§6a): pops the validation map and the class
+    // and runs the @override(...) / shadow diagnostic pass.
+    CASE_CODE(VALIDATE_OVERRIDES):
+    {
+      validateOverrides(vm);
+      DISPATCH();
+    }
+
     // REVATE EXTENSION: stores a field default on a class.
     // Stack: ..., class, value → ..., class
     CASE_CODE(FIELD_DEFAULT):
@@ -1477,6 +1972,93 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
         absSlot += classObj->superclass->numFields;
 
       // Lazily allocate the fieldDefaults array.
+      if (classObj->fieldDefaults == NULL)
+      {
+        classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);
+        for (int i = 0; i < classObj->numFields; i++)
+          classObj->fieldDefaults[i] = NULL_VAL;
+      }
+      if (absSlot < classObj->numFields)
+        classObj->fieldDefaults[absSlot] = val;
+      DISPATCH();
+    }
+
+    // REVATE EXTENSION (§6c): per-class mixin field default — runs at
+    // class-definition time, after CODE_BIND_MIXIN has merged the
+    // mixin's own defaults into the host's fieldDefaults[] but before
+    // CODE_VALIDATE_OVERRIDES.  Pops the value but leaves the class
+    // on the stack so a series of these can target the same class.
+    //
+    // Stack: ..., class, value → ..., class
+    // Operands: (mixinNameConst:short, fieldNameConst:short)
+    CASE_CODE(MIXIN_FIELD_DEFAULT):
+    {
+      int mixinNameConst = READ_SHORT();
+      int fieldNameConst = READ_SHORT();
+      Value val = POP();
+      ObjClass* classObj = AS_CLASS(PEEK());
+      ObjString* mixinName = AS_STRING(fn->constants.data[mixinNameConst]);
+      ObjString* fieldName = AS_STRING(fn->constants.data[fieldNameConst]);
+
+      // Walk classObj->mixins[] for the named mixin.
+      int slot = -1;
+      for (int i = 0; i < classObj->numMixins; i++)
+      {
+        ObjClass* m = classObj->mixins[i];
+        if (m != NULL && m->name != NULL &&
+            m->name->length == mixinName->length &&
+            memcmp(m->name->value, mixinName->value,
+                   (size_t)mixinName->length) == 0)
+        { slot = i; break; }
+      }
+      if (slot < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' is not on class '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(classObj->name));
+        RUNTIME_ERROR();
+      }
+
+      // Resolve per-mixin field slot via getter-bytecode scan — same
+      // machinery as LOAD_MIXIN_FIELD_THIS.  Every `var` and `public
+      // Num` declaration synthesizes a getter whose body opens with
+      // `LOAD_FIELD_THIS <slot>`.
+      int getterSym = wrenSymbolTableFind(&vm->methodNames,
+          fieldName->value, fieldName->length);
+      int fieldIdx = -1;
+      if (getterSym >= 0)
+      {
+        ObjClass* mixin = classObj->mixins[slot];
+        if (getterSym < mixin->methods.count)
+        {
+          Method* gm = &mixin->methods.data[getterSym];
+          if (gm->type == METHOD_BLOCK && gm->as.closure != NULL)
+          {
+            ObjFn* gfn = gm->as.closure->fn;
+            for (int ip2 = 0; ip2 < gfn->code.count; )
+            {
+              uint8_t op = gfn->code.data[ip2];
+              if (op == CODE_LOAD_FIELD_THIS)
+              { fieldIdx = gfn->code.data[ip2 + 1]; break; }
+              ip2++;
+            }
+          }
+        }
+      }
+      if (fieldIdx < 0)
+      {
+        vm->fiber->error = wrenStringFormat(vm,
+            "Mixin '@' does not declare field '@'.",
+            OBJ_VAL(mixinName), OBJ_VAL(fieldName));
+        RUNTIME_ERROR();
+      }
+
+      int absSlot = classObj->mixinFieldOffsets[slot] + fieldIdx;
+
+      // Lazily allocate the fieldDefaults array — wrenBindMixin
+      // would normally have populated it if the mixin had any field
+      // defaults, but a defaults { } block may be the only thing
+      // setting values for this host.
       if (classObj->fieldDefaults == NULL)
       {
         classObj->fieldDefaults = ALLOCATE_ARRAY(vm, Value, classObj->numFields);

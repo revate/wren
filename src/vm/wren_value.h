@@ -422,6 +422,32 @@ struct sObjClass
   ObjClass** mixins;        // array of bound mixins (for hasMixin checks)
   int numMixins;            // count of bound mixins
 
+  // REVATE EXTENSION (§6b): per-mixin field-offset and per-mixin
+  // method tables for `my.MixinName.method(...)` / `my.MixinName.field`
+  // explicit dispatch.  Both arrays are parallel to `mixins[]`: entry
+  // [i] describes how the i-th `with`-listed mixin sits on this host.
+  //
+  // mixinFieldOffsets[i]
+  //   The base offset of the i-th mixin's field block in this host's
+  //   flat field layout.  `wrenBindMixin` records it at bind time.
+  //   `my.M.x` resolves to LOAD_FIELD_THIS <fieldOffset + mixinIndex
+  //   of x in M's own field table>.
+  //
+  // mixinMethods[i]
+  //   A MethodBuffer holding the *offset-adjusted* clones of the
+  //   i-th mixin's methods.  Identical content to what wrenBindMixin
+  //   wrote into classObj->methods at bind time, but kept here so
+  //   `my.M.foo()` can still reach the mixin's body even when the
+  //   class shadows the slot.  When the class did NOT shadow,
+  //   mixinMethods[i].data[symbol] and classObj->methods.data[symbol]
+  //   refer to the same closure (shared pointer, not a copy).
+  //
+  // Both arrays are NULL until the first wrenBindMixin call on this
+  // class; after that they are sized MAX_MIXINS in lockstep with
+  // mixins[].
+  int* mixinFieldOffsets;
+  MethodBuffer* mixinMethods;
+
   // REVATE EXTENSION: Class-level field defaults.
   // If non-NULL, an array of [numFields] Values.  CONSTRUCT uses these
   // instead of NULL_VAL when creating instances.  Populated via
