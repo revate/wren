@@ -320,6 +320,16 @@ OPCODE(ATTACHMENT, -1)
 // attach-time (7b), not at declaration time.
 OPCODE(ATTACHMENT_TARGET, 0)
 
+// REVATE EXTENSION (§7d): Marks the attachment class on top of the
+// stack as `@unique`.  Sets `classObj->isUnique = true` so host.attach()
+// will refuse to install a duplicate of this attachment class on a
+// host that already carries one (returns null + stderr warning, leaves
+// the existing instance untouched).  Emitted once per attachment whose
+// declaration site carries the `@unique` attribute.
+//
+// Stack: ..., class → ..., class  (leaves the class for chaining)
+OPCODE(ATTACHMENT_UNIQUE, 0)
+
 // REVATE EXTENSION (§6a): Validates @override(MixinName) annotations and
 // emits compile-time warnings for unannotated shadows of mixin methods.
 //

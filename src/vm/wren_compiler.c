@@ -3305,6 +3305,8 @@ static int getByteCountForArguments(const uint8_t* bytecode,
     case CODE_END_CLASS:
     case CODE_BIND_MIXIN:
     case CODE_VALIDATE_OVERRIDES:
+    // REVATE EXTENSION (§7d): operand-less flag flip for @unique.
+    case CODE_ATTACHMENT_UNIQUE:
       return 0;
 
     case CODE_LOAD_LOCAL:
@@ -5009,6 +5011,59 @@ static void attachmentDefinition(Compiler* compiler)
     int nameConst = addConstant(compiler, targetNameValues[i]);
     emitShortArg(compiler, CODE_ATTACHMENT_TARGET, nameConst);
     emitOp(compiler, CODE_POP);
+  }
+
+  // REVATE EXTENSION (§7d): `@unique` modifier on attachment classes.
+  //
+  // The attribute is picked up from the compiler's pending-attribute
+  // map (populated by `matchAttribute` between the `attachment`
+  // keyword and the class name).  When present, emit
+  // CODE_ATTACHMENT_UNIQUE which flips the class's `isUnique` bit at
+  // class-definition time.  At attach-time, `object_attach` checks
+  // the bit and refuses to install a duplicate of the same attachment
+  // class on a host that already carries one (returns null + stderr
+  // warning, leaves the existing instance untouched).
+  //
+  // `@unique` is parsed by `matchAttribute` as a grouped attribute
+  // with group = NULL_VAL (the default group used for bare `@name`
+  // attributes without a `(...)` clause) and key = "unique".  We
+  // probe the NULL_VAL group map for the "unique" key.
+  //
+  // We deliberately drain only the `unique` entry so other attributes
+  // that happen to also tag the class (e.g. `@serialize attachment
+  // Loot ...`) survive into the classAttributes map for normal
+  // `copyAttributes` handling.
+  {
+    WrenVM* vm = compiler->parser->vm;
+    if (compiler->attributes != NULL && compiler->attributes->count > 0)
+    {
+      Value groupMapVal = wrenMapGet(compiler->attributes, NULL_VAL);
+      if (!IS_UNDEFINED(groupMapVal) && IS_MAP(groupMapVal))
+      {
+        ObjMap* groupMap  = AS_MAP(groupMapVal);
+        Value   uniqueKey = wrenNewStringLength(vm, "unique", 6);
+        wrenPushRoot(vm, AS_OBJ(uniqueKey));
+        Value uniqueVal = wrenMapGet(groupMap, uniqueKey);
+        if (!IS_UNDEFINED(uniqueVal))
+        {
+          loadVariable(compiler, classVariable);
+          emitOp(compiler, CODE_ATTACHMENT_UNIQUE);
+          emitOp(compiler, CODE_POP);
+          // Consume the `unique` entry so it doesn't leak into
+          // classAttributes (where it would surface as a runtime-
+          // visible attribute on every @unique attachment).
+          wrenMapRemoveKey(vm, groupMap, uniqueKey);
+          // If the NULL_VAL group is now empty, remove the group
+          // itself too so `compiler->attributes->count` reflects
+          // "no leftover attributes" for downstream callers.
+          if (groupMap->count == 0)
+          {
+            wrenMapRemoveKey(vm, compiler->attributes, NULL_VAL);
+          }
+        }
+        wrenPopRoot(vm); // uniqueKey
+      }
+    }
   }
 
   // Push a scope for the attachment body.

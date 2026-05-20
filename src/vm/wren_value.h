@@ -476,6 +476,21 @@ struct sObjClass
   bool isAttachment;
   ObjString** attachmentTargets;
   int numAttachmentTargets;
+
+  // REVATE EXTENSION (§7d): `@unique` modifier on an attachment class.
+  //
+  // When true, host.attach(_) refuses to install a second instance of
+  // this attachment class on a host that already has one.  The
+  // duplicate-attach attempt returns null instead of the attachment
+  // (and the original instance is unaffected).  A line is written to
+  // stderr to flag the conflict during development; the warning is
+  // not a hard error so `default attachments { ... }` inheritance
+  // chains (parent declares Loot; child also declares Loot) collapse
+  // gracefully to "parent wins".
+  //
+  // Always false on non-attachment classes (the §7d compile-time
+  // guard rejects `@unique` on anything that isn't an attachment).
+  bool isUnique;
 };
 
 typedef struct

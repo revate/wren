@@ -322,6 +322,8 @@ static int dumpInstruction(WrenVM* vm, ObjFn* fn, int i, int* lastLine)
       printf("'\n");
       break;
     }
+    // REVATE EXTENSION (§7d): @unique flag flip.  Zero operand bytes.
+    case CODE_ATTACHMENT_UNIQUE: printf("ATT_UNIQUE\n"); break;
 
     case CODE_VALIDATE_OVERRIDES: printf("VALIDATE_OVERRIDES\n"); break;
 

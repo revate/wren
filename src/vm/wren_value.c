@@ -62,6 +62,11 @@ ObjClass* wrenNewSingleClass(WrenVM* vm, int numFields, ObjString* name)
   classObj->isAttachment        = false;
   classObj->attachmentTargets   = NULL;
   classObj->numAttachmentTargets = 0;
+  // REVATE EXTENSION (§7d): `@unique` modifier.  Flipped by
+  // CODE_ATTACHMENT_UNIQUE on the class after attachmentDefinition
+  // observes the annotation.  Non-attachment classes always stay
+  // false.
+  classObj->isUnique             = false;
 
   wrenPushRoot(vm, (Obj*)classObj);
   wrenMethodBufferInit(&classObj->methods);
@@ -193,6 +198,10 @@ static int mixinGetArgBytes(const uint8_t* bytecode,
     case CODE_END_CLASS:
     case CODE_BIND_MIXIN:
     case CODE_VALIDATE_OVERRIDES:
+    // REVATE EXTENSION (§7d): operand-less flag flip — just reads the
+    // class off TOS, sets its isUnique bit, and leaves the class on
+    // the stack.
+    case CODE_ATTACHMENT_UNIQUE:
       return 0;
 
     case CODE_LOAD_LOCAL:

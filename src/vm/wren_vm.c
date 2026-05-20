@@ -1977,6 +1977,18 @@ static WrenInterpretResult runInterpreter(WrenVM* vm, register ObjFiber* fiber)
       DISPATCH();
     }
 
+    // REVATE EXTENSION (§7d): flip the `@unique` flag on the attachment
+    // class.  No operand bytes — the class is on top of the stack and
+    // stays there for any subsequent chained binding.
+    CASE_CODE(ATTACHMENT_UNIQUE):
+    {
+      ObjClass* classObj = AS_CLASS(PEEK());
+      ASSERT(classObj->isAttachment,
+             "CODE_ATTACHMENT_UNIQUE on a non-attachment class.");
+      classObj->isUnique = true;
+      DISPATCH();
+    }
+
     CASE_CODE(FOREIGN_CLASS):
     {
       createClass(vm, -1, fn->module);

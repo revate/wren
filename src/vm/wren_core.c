@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <float.h>
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -1114,6 +1115,12 @@ static void appendToAttachmentList(WrenVM* vm, ObjInstance* host, Value attVal)
   wrenValueBufferWrite(vm, &list->elements, attVal);
 }
 
+// REVATE EXTENSION (§7d): forward declaration of the FIFO lookup
+// helper.  The definition lives further down alongside its §7b LIFO
+// twin (`findLastAttachmentOfClass`); we need the declaration up here
+// because `object_attach`'s `@unique` guard calls it.
+static int findFirstAttachmentOfClass(ObjList* list, ObjClass* klass);
+
 // host.attach(att) — see comments at the top of the §7b block.
 DEF_PRIMITIVE(object_attach)
 {
@@ -1137,6 +1144,32 @@ DEF_PRIMITIVE(object_attach)
     return false;
   }
   ObjInstance* host = AS_INSTANCE(args[0]);
+
+  // REVATE EXTENSION (§7d): `@unique` attachments refuse to install a
+  // duplicate of the same attachment class on a host that already
+  // carries one.  This is a SOFT refusal: we return null + emit a
+  // WREN_ERROR_WARNING through the host's errorFn (so the editor
+  // / runner can surface it), leave the existing attachment intact,
+  // and do NOT fire `onAttached(host)` on the rejected instance.  The
+  // soft-refuse semantics let `default attachments { ... }`
+  // inheritance chains collapse gracefully — a parent's `Loot.new(25)`
+  // wins over a child's accidental second `Loot.new(50)` without
+  // killing construction.
+  if (attClass->isUnique &&
+      !IS_NULL(host->attachments) &&
+      findFirstAttachmentOfClass(AS_LIST(host->attachments), attClass) >= 0)
+  {
+    if (vm->config.errorFn != NULL)
+    {
+      char buf[256];
+      snprintf(buf, sizeof(buf),
+               "@unique attachment '%s' refused: host already has one "
+               "(returning null; existing instance left intact).",
+               attClass->name != NULL ? attClass->name->value : "?");
+      vm->config.errorFn(vm, WREN_ERROR_WARNING, "", 0, buf);
+    }
+    RETURN_NULL;
+  }
 
   // Write the host into the attachment's slot-0 `host` field.  The
   // synthesised setter would do the same thing but the direct write
@@ -1195,6 +1228,24 @@ DEF_PRIMITIVE(object_attach)
 static int findLastAttachmentOfClass(ObjList* list, ObjClass* klass)
 {
   for (int i = list->elements.count - 1; i >= 0; i--)
+  {
+    Value v = list->elements.data[i];
+    if (!IS_INSTANCE(v)) continue;
+    if (AS_INSTANCE(v)->obj.classObj == klass) return i;
+  }
+  return -1;
+}
+
+// REVATE EXTENSION (§7d): mirror of `findLastAttachmentOfClass` but
+// walking insertion order (oldest first).  Used by:
+//   - object_getAttachment(_) — returns the FIRST match, matching the
+//     §7d singular-getter contract.
+//   - object_attach's `@unique` guard — any match (first or last) is
+//     enough to refuse the duplicate, but using the FIFO walk keeps
+//     the lookup symmetric with getAttachment(_).
+static int findFirstAttachmentOfClass(ObjList* list, ObjClass* klass)
+{
+  for (int i = 0; i < list->elements.count; i++)
   {
     Value v = list->elements.data[i];
     if (!IS_INSTANCE(v)) continue;
@@ -1452,6 +1503,46 @@ DEF_PRIMITIVE(object_hasAttachment)
     }
   }
   RETURN_BOOL(false);
+}
+
+// REVATE EXTENSION (§7d): host.getAttachment(Klass) — singular form.
+//
+// Returns the first-attached instance of `Klass` on the host, or null
+// if none.  FIFO ordering: when multiple instances of the same
+// attachment class are stacked on the host, the OLDEST one wins.  This
+// is the natural shape for `@unique` attachments (where there can only
+// ever be one) and matches the "first attached, first reached" mental
+// model for non-unique stacks.
+//
+// For LIFO access — "newest" semantics, matching `detach(Klass)` —
+// callers can still reach `host.attachments(Klass)[host.attachments(Klass).count - 1]`.
+// Most game code that uses `default attachments { ... }` expects "the
+// Loot", not "the most recent Loot", so FIFO is the productive default.
+//
+// The argument is required to be an attachment class; a non-class
+// argument fires a runtime error consistent with the other §7b
+// primitives (`hasAttachment(_)`, `attachments(_)`).
+DEF_PRIMITIVE(object_getAttachment)
+{
+  if (!IS_CLASS(args[1]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "getAttachment(_) argument must be an attachment class.");
+    return false;
+  }
+
+  if (!IS_INSTANCE(args[0]) || IS_NULL(AS_INSTANCE(args[0])->attachments))
+  {
+    RETURN_NULL;
+  }
+
+  ObjInstance* host  = AS_INSTANCE(args[0]);
+  ObjClass*    klass = AS_CLASS(args[1]);
+  ObjList*     list  = AS_LIST(host->attachments);
+
+  int idx = findFirstAttachmentOfClass(list, klass);
+  if (idx < 0) RETURN_NULL;
+  RETURN_VAL(list->elements.data[idx]);
 }
 
 // host.attachments(klass) — list of every attached instance of class
@@ -1974,6 +2065,12 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->objectClass, "attachments(_)",   object_attachmentsOfClass);
   PRIMITIVE(vm->objectClass, "attachments",      object_attachmentsAll);
   PRIMITIVE(vm->objectClass, "detach()",         object_detachSelf);
+
+  // REVATE EXTENSION (§7d): singular getter — returns the first
+  // attachment of the given class (FIFO), or null if none.  Pairs
+  // with the `@unique` modifier on attachment declarations (where
+  // "first" is also "only").
+  PRIMITIVE(vm->objectClass, "getAttachment(_)", object_getAttachment);
 
   // REVATE EXTENSION (§7c): default-attachment hook bound on Object
   // as a no-op that returns its receiver.  Classes that declare
