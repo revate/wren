@@ -487,6 +487,20 @@ typedef struct
 typedef struct
 {
   Obj obj;
+
+  // REVATE EXTENSION (§7b): Per-instance attachment list.
+  //
+  // Lazy-allocated.  Defaults to NULL_VAL on every freshly-constructed
+  // instance — only the first host.attach(...) call on this instance
+  // upgrades the slot to OBJ_VAL(ObjList*) holding the attached
+  // attachment instances in insertion order (oldest first).
+  //
+  // Storing the list inline as a Value lets every ObjInstance carry
+  // attachment state without paying for a heap allocation it never
+  // uses; the common case is "this instance has no attachments" and
+  // the slot stays NULL_VAL forever.
+  Value attachments;
+
   Value fields[FLEXIBLE_ARRAY];
 } ObjInstance;
 

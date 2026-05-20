@@ -10,6 +10,7 @@
 #include "wren_math.h"
 #include "wren_primitive.h"
 #include "wren_value.h"
+#include "wren_vm.h"
 
 #include "wren_core.wren.inc"
 
@@ -944,6 +945,640 @@ DEF_PRIMITIVE(object_hasMixin)
   RETURN_BOOL(false);
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// REVATE EXTENSION (§7b): runtime attach / detach machinery for the
+// `attachment X targets Y { ... }` declaration shipped in §7a.
+//
+// All of the user-facing operations — `host.attach(att)`,
+// `host.detach(klass)`, `host.detach(att)`, `host.detachAll(klass)`,
+// `host.hasAttachment(klass)`, `host.attachments(klass)`,
+// `host.attachments`, and the self-detach sugar `att.detach()` from
+// inside an attachment method — are primitives on `Object`.  Putting
+// them on Object means any class instance (including foreign-class
+// proxies and attachment instances themselves) can host attachments
+// without each having to opt in.
+//
+// Per-instance state lives in `ObjInstance.attachments` (a Value,
+// lazy-allocated to OBJ_VAL(ObjList*) on first attach).  The attachment
+// instance's own slot-0 field stores its current host (the implicit
+// `host` field synthesised by §7a's attachmentDefinition).  Together
+// these two slots plus the per-class attachmentTargets[] name array
+// form the complete runtime state.
+// ───────────────────────────────────────────────────────────────────────
+
+// Returns true if `classObj` (or any class in its superclass chain) is
+// named `name`, OR has a mixin in its `mixins[]` array named `name`.
+//
+// 7b's `targets` matching is by NAME, not by ObjClass identity: a
+// targets clause like `targets Health` matches any class that mixes in
+// a class called "Health", regardless of module of origin.  This is
+// what makes Loot-targets-Health discoverable from Goblin without
+// Goblin or Loot ever importing each other.
+static bool classOrMixinNameMatches(ObjClass* classObj, ObjString* name)
+{
+  while (classObj != NULL)
+  {
+    // Direct class-name match.
+    if (classObj->name != NULL &&
+        classObj->name->length == name->length &&
+        memcmp(classObj->name->value, name->value,
+               (size_t)name->length) == 0)
+    {
+      return true;
+    }
+
+    // Mixin-name match: `targets Health` should accept any class that
+    // mixes in Health.
+    for (int i = 0; i < classObj->numMixins; i++)
+    {
+      ObjClass* m = classObj->mixins[i];
+      if (m != NULL && m->name != NULL &&
+          m->name->length == name->length &&
+          memcmp(m->name->value, name->value,
+                 (size_t)name->length) == 0)
+      {
+        return true;
+      }
+    }
+
+    classObj = classObj->superclass;
+  }
+  return false;
+}
+
+// Returns true if `att`'s `attachmentTargets[]` accepts `hostClass`.
+// Wildcard `"*"` matches any host class.
+static bool attachmentAccepts(ObjClass* attachmentClass, ObjClass* hostClass)
+{
+  for (int i = 0; i < attachmentClass->numAttachmentTargets; i++)
+  {
+    ObjString* target = attachmentClass->attachmentTargets[i];
+    if (target->length == 1 && target->value[0] == '*') return true;
+    if (classOrMixinNameMatches(hostClass, target)) return true;
+  }
+  return false;
+}
+
+// Look up the symbol for a bracketed VM-internal trampoline (e.g.
+// `<onAttached>(_)`) and pull the matching method off `classObj`.
+// Returns NULL if not present.  Every class produced by
+// `attachmentDefinition` carries the two §7b trampolines, but this
+// guard keeps the dispatch path correct when a non-attachment somehow
+// ends up here.
+static ObjClosure* attachmentTrampoline(WrenVM* vm, ObjClass* classObj,
+                                        const char* signature, int sigLen)
+{
+  int symbol = wrenSymbolTableFind(&vm->methodNames, signature, (size_t)sigLen);
+  if (symbol < 0) return NULL;
+  if (symbol >= classObj->methods.count) return NULL;
+  Method* m = &classObj->methods.data[symbol];
+  if (m->type != METHOD_BLOCK) return NULL;
+  return (ObjClosure*)m->as.closure;
+}
+
+// Common pre-dispatch validation for host.attach(att).
+// Returns true on success (caller proceeds with bookkeeping + trampoline
+// invocation).  On failure, sets fiber->error and returns false.
+static bool validateAttachArgs(WrenVM* vm, Value hostVal, Value attVal,
+                               ObjClass** outHostClass, ObjInstance** outAtt,
+                               ObjClass** outAttClass)
+{
+  // (1) `att` must be an instance.  Instance vs Foreign: only ObjInstance
+  // has the `host` field synthesised at slot 0, so foreign objects
+  // cannot stand in for attachments.
+  if (!IS_INSTANCE(attVal))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "attach(_) argument must be an attachment instance.");
+    return false;
+  }
+
+  ObjInstance* att      = AS_INSTANCE(attVal);
+  ObjClass*    attClass = att->obj.classObj;
+
+  // (2) Its class must be marked as an attachment.
+  if (!attClass->isAttachment)
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "attach(_) argument's class '@' is not an attachment "
+        "(declared with `attachment ... targets ...`).",
+        OBJ_VAL(attClass->name));
+    return false;
+  }
+
+  // (3) The attachment must not currently be attached to anything.
+  //     The implicit `host` field sits at slot 0; non-null means bound.
+  if (attClass->numFields >= 1 && !IS_NULL(att->fields[0]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "Attachment '@' is already attached to a host. Detach it first.",
+        OBJ_VAL(attClass->name));
+    return false;
+  }
+
+  // (4) The host's class (or its mixin chain) must satisfy the
+  //     attachment's `targets` clause.
+  ObjClass* hostClass = wrenGetClass(vm, hostVal);
+  if (!attachmentAccepts(attClass, hostClass))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "Attachment '@' does not target host class '@'.",
+        OBJ_VAL(attClass->name), OBJ_VAL(hostClass->name));
+    return false;
+  }
+
+  *outHostClass = hostClass;
+  *outAtt       = att;
+  *outAttClass  = attClass;
+  return true;
+}
+
+// Append `att` to the host instance's per-instance attachment list,
+// lazily allocating the list on first use.
+//
+// Lazy-allocation strategy keeps the common "this instance never
+// attaches anything" case zero-cost: ObjInstance.attachments stays
+// NULL_VAL forever and no ObjList is created.
+static void appendToAttachmentList(WrenVM* vm, ObjInstance* host, Value attVal)
+{
+  if (IS_NULL(host->attachments))
+  {
+    // Pin the about-to-be-appended value as a GC root in case the
+    // ObjList allocation triggers a collection.
+    wrenPushRoot(vm, AS_OBJ(attVal));
+    ObjList* list = wrenNewList(vm, 0);
+    host->attachments = OBJ_VAL(list);
+    wrenPopRoot(vm);
+  }
+  ObjList* list = AS_LIST(host->attachments);
+  wrenValueBufferWrite(vm, &list->elements, attVal);
+}
+
+// host.attach(att) — see comments at the top of the §7b block.
+DEF_PRIMITIVE(object_attach)
+{
+  ObjClass*    hostClass;
+  ObjInstance* att;
+  ObjClass*    attClass;
+  if (!validateAttachArgs(vm, args[0], args[1],
+                          &hostClass, &att, &attClass))
+  {
+    return false;
+  }
+
+  // §7b: attach() is only legal on ObjInstance hosts.  A foreign-class
+  // host would have no `attachments` slot to store the list in (the
+  // ObjForeign struct uses its tail bytes for foreign data, not Wren
+  // Values).
+  if (!IS_INSTANCE(args[0]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "attach(_) receiver must be a class instance, not a foreign object.");
+    return false;
+  }
+  ObjInstance* host = AS_INSTANCE(args[0]);
+
+  // Write the host into the attachment's slot-0 `host` field.  The
+  // synthesised setter would do the same thing but the direct write
+  // skips an unnecessary frame.
+  att->fields[0] = args[0];
+
+  // Append to the host's per-instance list (lazy-allocated).
+  appendToAttachmentList(vm, host, args[1]);
+
+  // Dispatch the `<onAttached>(_)` trampoline on the attachment.  The
+  // trampoline calls user-visible `onAttached(host)` and returns
+  // `this` so the outer primitive's caller sees `att` as the value of
+  // `host.attach(att)`.
+  ObjClosure* trampoline =
+      attachmentTrampoline(vm, attClass, "<onAttached>(_)", 15);
+
+  // Every attachment class is synthesised with this trampoline in
+  // attachmentDefinition; missing it would indicate a bytecode-build
+  // bug, so abort loudly rather than silently returning att.
+  if (trampoline == NULL)
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "Internal: attachment '@' has no <onAttached>(_) trampoline.",
+        OBJ_VAL(attClass->name));
+    return false;
+  }
+
+  // Re-layout the outer primitive's stack as the trampoline's call
+  // frame so the trampoline's CODE_RETURN drops its result (`att`)
+  // directly into the outer caller's expected result slot:
+  //
+  //   Outer stack before:  [host, att]              (stackTop = +2)
+  //   Inner frame wants:   [att,  host]             (stackStart = args[0])
+  //
+  //   args[0] := att          — outer's return slot now points at att
+  //   args[1] := host         — overwrite the dropped att with host
+  //
+  // After inner CODE_RETURN, stackStart[0] = trampoline's returned
+  // `this` (== att); stackTop = stackStart + 1.  That leaves the
+  // outer caller with exactly one slot containing `att`, which is the
+  // documented chained-result shape of `host.attach(att)`.
+  args[0] = args[1];      // args[0] = att
+  args[1] = OBJ_VAL(host); // args[1] = host
+
+  // Push the trampoline frame.  numArgs = 2 (this + host).  This sets
+  // the inner frame's stackStart to args[0], so the trampoline's
+  // implicit `this` is att and its single argument is host.
+  wrenCallFunction(vm, vm->fiber, trampoline, 2);
+  return false;
+}
+
+// Walk a host's attachment list looking for the most-recently-attached
+// instance of `klass`.  Returns the array index in `list->elements`,
+// or -1 if no match.  LIFO order — the design doc explicitly mandates
+// this for both `detach(Klass)` (single) and `detachAll(Klass)`.
+static int findLastAttachmentOfClass(ObjList* list, ObjClass* klass)
+{
+  for (int i = list->elements.count - 1; i >= 0; i--)
+  {
+    Value v = list->elements.data[i];
+    if (!IS_INSTANCE(v)) continue;
+    if (AS_INSTANCE(v)->obj.classObj == klass) return i;
+  }
+  return -1;
+}
+
+// Same but matching a specific attachment instance by identity.
+static int findAttachmentInstance(ObjList* list, ObjInstance* att)
+{
+  for (int i = list->elements.count - 1; i >= 0; i--)
+  {
+    Value v = list->elements.data[i];
+    if (IS_INSTANCE(v) && AS_INSTANCE(v) == att) return i;
+  }
+  return -1;
+}
+
+// Remove the i-th element from `list->elements` in O(n).  Used by the
+// detach machinery.  We keep the relative order of remaining elements
+// so introspection's "in attachment order" guarantee is preserved.
+static void removeListElementAt(ObjList* list, int index)
+{
+  for (int j = index; j < list->elements.count - 1; j++)
+  {
+    list->elements.data[j] = list->elements.data[j + 1];
+  }
+  list->elements.count--;
+}
+
+// Common detach finisher: invokes the `<onDetached>(_)` trampoline on
+// `att` with the saved host, clears att's host slot, leaves att's
+// position in `args[0]` so the primitive's caller sees the returned
+// instance.  Caller must have already removed att from the host's list.
+//
+// Returns false from the primitive (control passes to the trampoline
+// via the same stack-relayout trick described in `object_attach`).
+static bool dispatchOnDetached(WrenVM* vm, Value* args,
+                               ObjInstance* att, Value hostVal)
+{
+  ObjClass* attClass = att->obj.classObj;
+  ObjClosure* trampoline =
+      attachmentTrampoline(vm, attClass, "<onDetached>(_)", 15);
+
+  // Clear the host slot AFTER the trampoline reads it would be ideal,
+  // but the trampoline's user-overridable onDetached(host) takes host
+  // as its parameter — it does not read the slot.  Clearing here means
+  // `this.host` inside `onDetached` returns null, which the design
+  // explicitly accepts ("After onDetached returns, this.host becomes
+  // invalid").  Keeping the slot live throughout would require a
+  // second post-trampoline primitive entry, which the current
+  // primitive ABI cannot express.
+  if (attClass->numFields >= 1)
+  {
+    att->fields[0] = NULL_VAL;
+  }
+
+  if (trampoline == NULL)
+  {
+    // No trampoline — return att directly (shouldn't happen for
+    // attachment-declared classes but stays safe for non-attachments).
+    args[0] = OBJ_VAL(att);
+    return true;
+  }
+
+  // Re-layout outer stack as the trampoline's call frame.
+  //   Outer:  [<irrelevant>, <irrelevant>]
+  //   Inner:  [att, host]                  (numArgs = 2)
+  args[0] = OBJ_VAL(att);
+  args[1] = hostVal;
+
+  wrenCallFunction(vm, vm->fiber, trampoline, 2);
+  return false;
+}
+
+// host.detach(_) — the argument is either an attachment class or an
+// attachment instance.  Class form: removes the most-recently-attached
+// instance of that class (LIFO).  Instance form: removes that specific
+// instance.  Returns the removed instance, or null if no match (class
+// form) / a runtime error (instance form, not on this host).
+DEF_PRIMITIVE(object_detach)
+{
+  if (!IS_INSTANCE(args[0]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "detach(_) receiver must be a class instance.");
+    return false;
+  }
+  ObjInstance* host = AS_INSTANCE(args[0]);
+
+  // Host has no list → nothing to detach.
+  if (IS_NULL(host->attachments))
+  {
+    // For the class form, return null (no match isn't an error).
+    // For the instance form, this IS an error (the caller passed a
+    // specific instance that must be on this host).
+    if (IS_CLASS(args[1]))
+    {
+      args[0] = NULL_VAL;
+      return true;
+    }
+    if (IS_INSTANCE(args[1]))
+    {
+      vm->fiber->error = wrenStringFormat(vm,
+          "Attachment is not attached to this host.");
+      return false;
+    }
+    vm->fiber->error = wrenStringFormat(vm,
+        "detach(_) argument must be an attachment class or instance.");
+    return false;
+  }
+
+  ObjList* list = AS_LIST(host->attachments);
+  int idx = -1;
+
+  if (IS_CLASS(args[1]))
+  {
+    ObjClass* klass = AS_CLASS(args[1]);
+    idx = findLastAttachmentOfClass(list, klass);
+    if (idx < 0)
+    {
+      // No matching attachment — return null (not an error per design).
+      args[0] = NULL_VAL;
+      return true;
+    }
+  }
+  else if (IS_INSTANCE(args[1]))
+  {
+    ObjInstance* att = AS_INSTANCE(args[1]);
+    idx = findAttachmentInstance(list, att);
+    if (idx < 0)
+    {
+      vm->fiber->error = wrenStringFormat(vm,
+          "Attachment '@' is not attached to this host.",
+          OBJ_VAL(att->obj.classObj->name));
+      return false;
+    }
+  }
+  else
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "detach(_) argument must be an attachment class or instance.");
+    return false;
+  }
+
+  ObjInstance* att = AS_INSTANCE(list->elements.data[idx]);
+  Value hostVal    = OBJ_VAL(host);
+
+  // Remove from the list BEFORE the trampoline runs.  The design
+  // wants `onDetached(host)` to fire with the host still readable as
+  // a parameter; list membership is irrelevant to that.  Removing
+  // first also prevents the trampoline (which could re-entrantly
+  // call `host.attach(...)` or `host.detachAll(...)`) from seeing
+  // a half-detached intermediate state.
+  removeListElementAt(list, idx);
+
+  return dispatchOnDetached(vm, args, att, hostVal);
+}
+
+// host.detachAll(_) — argument is an attachment class.  Removes every
+// matching attachment in LIFO order and returns the number of
+// attachments removed.
+//
+// A C primitive owns exactly one frame transition per invocation, so
+// detachAll cannot fire the user-overridable `onDetached(host)` hook
+// per-attachment from this primitive.  §7b spec calls this out
+// explicitly: `detachAll(Klass)` clears the host slot of every
+// matching attachment and removes them from the list, but does NOT
+// invoke `onDetached(host)` on any of them.  Callers who need
+// per-attachment lifecycle hooks should loop `host.detach(Klass)`
+// instead — that path drives the trampoline once per call.
+DEF_PRIMITIVE(object_detachAll)
+{
+  if (!IS_INSTANCE(args[0]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "detachAll(_) receiver must be a class instance.");
+    return false;
+  }
+  if (!IS_CLASS(args[1]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "detachAll(_) argument must be an attachment class.");
+    return false;
+  }
+
+  ObjInstance* host  = AS_INSTANCE(args[0]);
+  ObjClass*    klass = AS_CLASS(args[1]);
+
+  if (IS_NULL(host->attachments))
+  {
+    RETURN_NUM(0);
+  }
+
+  ObjList* list = AS_LIST(host->attachments);
+
+  // Pass 1: count matches and clear the host slot on every match so
+  // their `this.host` reads null on (potentially-foreign-driven) tick
+  // closures that survive the detach.  This part runs entirely in C.
+  int count = 0;
+  for (int i = list->elements.count - 1; i >= 0; i--)
+  {
+    Value v = list->elements.data[i];
+    if (!IS_INSTANCE(v)) continue;
+    ObjInstance* att = AS_INSTANCE(v);
+    if (att->obj.classObj != klass) continue;
+    if (att->obj.classObj->numFields >= 1)
+    {
+      att->fields[0] = NULL_VAL;
+    }
+    count++;
+  }
+
+  // Pass 2: remove matched entries from the list in LIFO order.  Note
+  // that the user-overridable `onDetached(host)` hook is NOT invoked
+  // by detachAll — this is the documented trade-off for the
+  // single-frame primitive ABI.  Callers who need lifecycle hooks
+  // fired per-attachment should loop `host.detach(Klass)` instead.
+  for (int i = list->elements.count - 1; i >= 0; i--)
+  {
+    Value v = list->elements.data[i];
+    if (IS_INSTANCE(v) && AS_INSTANCE(v)->obj.classObj == klass)
+    {
+      removeListElementAt(list, i);
+    }
+  }
+
+  RETURN_NUM(count);
+}
+
+// host.hasAttachment(klass) — true if any attached instance has class
+// `klass` (exact match, no superclass / mixin walk).
+DEF_PRIMITIVE(object_hasAttachment)
+{
+  if (!IS_CLASS(args[1]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "hasAttachment(_) argument must be an attachment class.");
+    return false;
+  }
+  if (!IS_INSTANCE(args[0])) RETURN_BOOL(false);
+
+  ObjInstance* host  = AS_INSTANCE(args[0]);
+  ObjClass*    klass = AS_CLASS(args[1]);
+
+  if (IS_NULL(host->attachments)) RETURN_BOOL(false);
+  ObjList* list = AS_LIST(host->attachments);
+  for (int i = 0; i < list->elements.count; i++)
+  {
+    Value v = list->elements.data[i];
+    if (IS_INSTANCE(v) && AS_INSTANCE(v)->obj.classObj == klass)
+    {
+      RETURN_BOOL(true);
+    }
+  }
+  RETURN_BOOL(false);
+}
+
+// host.attachments(klass) — list of every attached instance of class
+// `klass`, in attachment order (oldest first).  Empty list if none.
+DEF_PRIMITIVE(object_attachmentsOfClass)
+{
+  if (!IS_CLASS(args[1]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "attachments(_) argument must be an attachment class.");
+    return false;
+  }
+
+  ObjList* out = wrenNewList(vm, 0);
+
+  if (!IS_INSTANCE(args[0]) || IS_NULL(AS_INSTANCE(args[0])->attachments))
+  {
+    RETURN_OBJ(out);
+  }
+
+  // Pin the freshly-allocated output list against the buffer-write
+  // allocations below.
+  wrenPushRoot(vm, (Obj*)out);
+
+  ObjInstance* host  = AS_INSTANCE(args[0]);
+  ObjClass*    klass = AS_CLASS(args[1]);
+  ObjList*     list  = AS_LIST(host->attachments);
+
+  for (int i = 0; i < list->elements.count; i++)
+  {
+    Value v = list->elements.data[i];
+    if (IS_INSTANCE(v) && AS_INSTANCE(v)->obj.classObj == klass)
+    {
+      wrenValueBufferWrite(vm, &out->elements, v);
+    }
+  }
+
+  wrenPopRoot(vm);
+  RETURN_OBJ(out);
+}
+
+// host.attachments — no-arg getter — returns every attachment in
+// attachment order (oldest first), regardless of class.  Returns an
+// empty list when no attachments are present (consistent with the
+// per-class form).
+DEF_PRIMITIVE(object_attachmentsAll)
+{
+  ObjList* out = wrenNewList(vm, 0);
+
+  if (!IS_INSTANCE(args[0]) || IS_NULL(AS_INSTANCE(args[0])->attachments))
+  {
+    RETURN_OBJ(out);
+  }
+
+  wrenPushRoot(vm, (Obj*)out);
+
+  ObjList* list = AS_LIST(AS_INSTANCE(args[0])->attachments);
+  for (int i = 0; i < list->elements.count; i++)
+  {
+    wrenValueBufferWrite(vm, &out->elements, list->elements.data[i]);
+  }
+
+  wrenPopRoot(vm);
+  RETURN_OBJ(out);
+}
+
+// att.detach() — zero-arg self-detach sugar.  Only valid on
+// attachment instances whose `host` slot is currently non-null.
+// Reaches the host through `att.fields[0]`, then performs the
+// equivalent of `host.detach(att)`.
+DEF_PRIMITIVE(object_detachSelf)
+{
+  if (!IS_INSTANCE(args[0]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "detach() (zero-arg) is only valid on attachment instances.");
+    return false;
+  }
+  ObjInstance* att = AS_INSTANCE(args[0]);
+  ObjClass* attClass = att->obj.classObj;
+
+  if (!attClass->isAttachment)
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "detach() (zero-arg) is only valid on attachment instances; "
+        "'@' is not an attachment.",
+        OBJ_VAL(attClass->name));
+    return false;
+  }
+
+  if (attClass->numFields < 1 || IS_NULL(att->fields[0]))
+  {
+    vm->fiber->error = wrenStringFormat(vm,
+        "Attachment '@' is not attached to any host.",
+        OBJ_VAL(attClass->name));
+    return false;
+  }
+
+  Value hostVal = att->fields[0];
+
+  // The host slot is set, but defensively guard against a host that
+  // somehow lost its list (shouldn't happen, but graceful failure
+  // beats segfault).
+  if (!IS_INSTANCE(hostVal) || IS_NULL(AS_INSTANCE(hostVal)->attachments))
+  {
+    // Treat as already-detached state: clear the slot, return att.
+    att->fields[0] = NULL_VAL;
+    args[0] = OBJ_VAL(att);
+    return true;
+  }
+
+  ObjInstance* host = AS_INSTANCE(hostVal);
+  ObjList*     list = AS_LIST(host->attachments);
+
+  int idx = findAttachmentInstance(list, att);
+  if (idx < 0)
+  {
+    // Slot says host X but X's list doesn't contain us.  Recover.
+    att->fields[0] = NULL_VAL;
+    args[0] = OBJ_VAL(att);
+    return true;
+  }
+
+  removeListElementAt(list, idx);
+  return dispatchOnDetached(vm, args, att, hostVal);
+}
+
 DEF_PRIMITIVE(range_from)
 {
   RETURN_NUM(AS_RANGE(args[0])->from);
@@ -1298,6 +1933,22 @@ void wrenInitializeCore(WrenVM* vm)
   PRIMITIVE(vm->objectClass, "toString", object_toString);
   PRIMITIVE(vm->objectClass, "type", object_type);
   PRIMITIVE(vm->objectClass, "hasMixin(_)", object_hasMixin);
+
+  // REVATE EXTENSION (§7b): runtime attachment dispatch.  These live
+  // on Object so every class instance (regular, mixin-bound, or
+  // attachment-target) participates in the attach/detach machinery
+  // without per-class opt-in.  The bookkeeping is C-side; lifecycle
+  // hooks (`onAttached(_)` / `onDetached(_)`) fire through the
+  // bracketed `<onAttached>(_)` / `<onDetached>(_)` trampolines
+  // synthesised on every attachment class by §7a's
+  // attachmentDefinition.
+  PRIMITIVE(vm->objectClass, "attach(_)",        object_attach);
+  PRIMITIVE(vm->objectClass, "detach(_)",        object_detach);
+  PRIMITIVE(vm->objectClass, "detachAll(_)",     object_detachAll);
+  PRIMITIVE(vm->objectClass, "hasAttachment(_)", object_hasAttachment);
+  PRIMITIVE(vm->objectClass, "attachments(_)",   object_attachmentsOfClass);
+  PRIMITIVE(vm->objectClass, "attachments",      object_attachmentsAll);
+  PRIMITIVE(vm->objectClass, "detach()",         object_detachSelf);
 
   // Now we can define Class, which is a subclass of Object.
   vm->classClass = defineClass(vm, coreModule, "Class");

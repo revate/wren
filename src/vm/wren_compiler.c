@@ -3704,18 +3704,18 @@ static void createConstructor(Compiler* compiler, Signature* signature,
 {
   Compiler methodCompiler;
   initCompiler(&methodCompiler, compiler->parser, compiler, true);
-  
+
   // Allocate the instance.
   emitOp(&methodCompiler, compiler->enclosingClass->isForeign
        ? CODE_FOREIGN_CONSTRUCT : CODE_CONSTRUCT);
-  
+
   // Run its initializer.
   emitShortArg(&methodCompiler, (Code)(CODE_CALL_0 + signature->arity),
                initializerSymbol);
-  
+
   // Return the instance.
   emitOp(&methodCompiler, CODE_RETURN);
-  
+
   endCompiler(&methodCompiler, "", 0);
 }
 
@@ -5088,6 +5088,135 @@ static void attachmentDefinition(Compiler* compiler)
 
     defineMethod(compiler, classVariable, /*isStatic*/ false,
                  /*isPublic*/ true, setterSymbol);
+  }
+
+  // ── Synthesise default no-op lifecycle hooks ──
+  //
+  // §7a / §7b: every attachment carries `onAttached(_)`, `onDetached(_)`,
+  // and `onHostDestroyed(_)` as implicitly-public methods.  When the
+  // user doesn't override them they default to no-ops returning null.
+  //
+  // We emit the no-op bodies FIRST (before the body parses), then the
+  // user's overrides — bound through the regular `method()` path —
+  // replace the entries in the class's runtime methods table.  Both
+  // emit `CODE_METHOD_INSTANCE_PUBLIC <symbol>` against the same
+  // symbol; at runtime the second binding wins.
+  //
+  // We deliberately bypass `declareMethod` here.  `declareMethod`
+  // writes into `classInfo.methods` for duplicate detection; if we
+  // recorded the symbol there, the user's identically-named override
+  // would trigger "already defines a method" at compile time.  The
+  // implicit-public bookkeeping the regular `method()` path performs
+  // for `onAttached` / `onDetached` / `onHostDestroyed` (see the rule
+  // shipped in §7a) still applies, so user overrides remain public.
+  static const char* const k7bDefaultHooks[3] = {
+      "onAttached", "onDetached", "onHostDestroyed"
+  };
+  for (int h = 0; h < 3; h++)
+  {
+    Signature hookSig;
+    hookSig.name = k7bDefaultHooks[h];
+    hookSig.length = (int)strlen(k7bDefaultHooks[h]);
+    hookSig.type = SIG_METHOD;
+    hookSig.arity = 1;
+
+    char hookFullSig[MAX_METHOD_SIGNATURE];
+    int hookSigLen;
+    signatureToString(&hookSig, hookFullSig, &hookSigLen);
+
+    // Resolve / create the global methodNames symbol without recording
+    // it in classInfo.methods (skipping `declareMethod`'s duplicate
+    // check so a user-provided override below isn't reported as a
+    // redeclaration).
+    int hookSymbol = methodSymbol(compiler, hookFullSig, hookSigLen);
+
+    Compiler hookCompiler;
+    initCompiler(&hookCompiler, compiler->parser, compiler, true);
+
+    // Parameter occupies local slot 1.
+    hookCompiler.numLocals++;
+    hookCompiler.numSlots++;
+
+    // Body: return null.
+    emitOp(&hookCompiler, CODE_NULL);
+    emitOp(&hookCompiler, CODE_RETURN);
+
+    endCompiler(&hookCompiler, hookFullSig, hookSigLen);
+
+    defineMethod(compiler, classVariable, /*isStatic*/ false,
+                 /*isPublic*/ true, hookSymbol);
+  }
+
+  // ── Synthesise the §7b attach / detach trampolines ──
+  //
+  // The host.attach(att) primitive does its bookkeeping in C, then
+  // dispatches a trampoline method on the attachment instance to (a)
+  // invoke the user-overridable `onAttached(host)` hook in a Wren
+  // frame and (b) return `this` so the outer primitive's caller sees
+  // `att` as the chained result of `host.attach(att)`.  Mirror
+  // trampoline for the detach path.
+  //
+  // Trampoline names are bracketed (`<...>`) so they are not callable
+  // from user Wren code — they live purely as VM-internal dispatch
+  // entry points.  Bracketed names share the constructor/finalizer
+  // naming convention used by `<allocate>` / `<finalize>`.
+  static const struct {
+    const char* signature;
+    const char* hookName;
+    int         hookNameLen;
+  } k7bTrampolines[2] = {
+      { "<onAttached>(_)",       "onAttached",      10 },
+      { "<onDetached>(_)",       "onDetached",      10 },
+  };
+  for (int t = 0; t < 2; t++)
+  {
+    int sigLen = (int)strlen(k7bTrampolines[t].signature);
+    int trampolineSymbol = methodSymbol(compiler,
+                                        k7bTrampolines[t].signature, sigLen);
+
+    Compiler trampolineCompiler;
+    initCompiler(&trampolineCompiler, compiler->parser, compiler, true);
+
+    // Set arity for `(_)`.
+    trampolineCompiler.numLocals++;
+    trampolineCompiler.numSlots++;
+
+    // Look up the hook method symbol that this trampoline dispatches.
+    // The default no-op was just declared above, so the symbol is
+    // guaranteed live by this point.
+    char hookFullSig[MAX_METHOD_SIGNATURE];
+    int  hookSigLen = 0;
+    memcpy(hookFullSig, k7bTrampolines[t].hookName,
+           (size_t)k7bTrampolines[t].hookNameLen);
+    hookSigLen = k7bTrampolines[t].hookNameLen;
+    hookFullSig[hookSigLen++] = '(';
+    hookFullSig[hookSigLen++] = '_';
+    hookFullSig[hookSigLen++] = ')';
+    int hookSymbol = methodSymbol(compiler, hookFullSig, hookSigLen);
+
+    // Body:
+    //   LOAD_LOCAL_0          ; push this
+    //   LOAD_LOCAL_1          ; push host arg
+    //   CALL_1 <hook>         ; invoke this.hook(host); result on TOS
+    //   POP                   ; discard result
+    //   LOAD_LOCAL_0          ; push this
+    //   RETURN
+    emitOp(&trampolineCompiler, CODE_LOAD_LOCAL_0);
+    emitOp(&trampolineCompiler, CODE_LOAD_LOCAL_1);
+    emitShortArg(&trampolineCompiler, CODE_CALL_1, hookSymbol);
+    emitOp(&trampolineCompiler, CODE_POP);
+    emitOp(&trampolineCompiler, CODE_LOAD_LOCAL_0);
+    emitOp(&trampolineCompiler, CODE_RETURN);
+
+    endCompiler(&trampolineCompiler,
+                k7bTrampolines[t].signature, sigLen);
+
+    // Bind the trampoline as a regular instance method on the
+    // attachment class.  isPublic doesn't really matter here — the
+    // signature is bracketed so user Wren can't name it — but we mark
+    // it public for consistency with the other synthesised members.
+    defineMethod(compiler, classVariable, /*isStatic*/ false,
+                 /*isPublic*/ true, trampolineSymbol);
   }
 
   // ── Compile the body ──

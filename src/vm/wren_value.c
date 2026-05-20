@@ -669,6 +669,10 @@ Value wrenNewInstance(WrenVM* vm, ObjClass* classObj)
                                         Value, classObj->numFields);
   initObj(vm, &instance->obj, OBJ_INSTANCE, classObj);
 
+  // REVATE EXTENSION (§7b): no attachments by default.  The slot is
+  // upgraded to OBJ_VAL(ObjList*) lazily on the first host.attach(...).
+  instance->attachments = NULL_VAL;
+
   // REVATE EXTENSION: use class-level field defaults if available.
   if (classObj->fieldDefaults != NULL)
   {
@@ -1574,6 +1578,11 @@ static void blackenInstance(WrenVM* vm, ObjInstance* instance)
   {
     wrenGrayValue(vm, instance->fields[i]);
   }
+
+  // REVATE EXTENSION (§7b): trace the per-instance attachment list.
+  // Lazy-allocated, so the common case is NULL_VAL and wrenGrayValue
+  // is a no-op.
+  wrenGrayValue(vm, instance->attachments);
 
   // Keep track of how much memory is still in use.
   vm->bytesAllocated += sizeof(ObjInstance);
